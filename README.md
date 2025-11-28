@@ -1,6 +1,6 @@
 # plateflow
 A robust fluorescence plate-reader analysis pipeline for kinetic assays. Includes per-well baseline fitting, normalization, replicate aggregation, mean ± SEM statistics, and kinetic modeling with automated parameter extraction. Designed for multi-plate datasets with noisy baselines and variable well performance. Supports different plate sizes but defaults to 384-well plates.
-
+<img width="1792" height="1032" alt="image" src="https://github.com/user-attachments/assets/884ce123-503a-4c06-bfdc-d758f3550b1f" />
 ## Overview
 
 Plate Viewer processes Excel files containing fluorescence time-course data from multi-well plates and generates:
