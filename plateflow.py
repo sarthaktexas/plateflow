@@ -441,7 +441,7 @@ def write_csvs_for_plate(long_df: pd.DataFrame, csv_root: str, config: Dict[str,
                     
                     if len(values_at_time) >= 2:
                         mean = sum(values_at_time) / len(values_at_time)
-                        variance = sum((v - mean) ** 2 for v in values_at_time) / len(values_at_time)
+                        variance = sum((v - mean) ** 2 for v in values_at_time) / (len(values_at_time) - 1) # Sample variance using Bessel's correction/sample standard deviation
                         std_dev = variance ** 0.5
                         sem = std_dev / (len(values_at_time) ** 0.5)
                         mean_values.append(mean)
