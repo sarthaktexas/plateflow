@@ -2108,12 +2108,12 @@ function renderPlateGrid() {
   const wellCounts = {}; // Track how many datasets have data for each well
 
   // Count datasets per well, filtering by enabled wells
-  // Normalize well IDs to ensure consistent matching
+  // Normalize well IDs to ensure consistent matching (zero-padded format)
   selectedDatasets.forEach(plateId => {
     const wells = allWellsData[plateId] || {};
     Object.keys(wells).forEach(wellId => {
-      // Normalize well ID (remove spaces, ensure consistent format)
-      const normalizedWellId = String(wellId).trim().toUpperCase();
+      // Normalize well ID to zero-padded format (e.g., "B5" -> "B05", "B13" -> "B13")
+      const normalizedWellId = normalizeWellId(wellId);
       
       // Filter by enabledWells if any are set (check both original and normalized)
       if (enabledWells.size > 0 && !enabledWells.has(wellId) && !enabledWells.has(normalizedWellId)) {
@@ -2149,7 +2149,7 @@ function renderPlateGrid() {
     // Wells
     for (let col = 1; col <= PLATE_COLS; col++) {
       const wellId = rowLetter + String(col);
-      const normalizedWellId = wellId.toUpperCase(); // Normalize for matching
+      const normalizedWellId = normalizeWellId(wellId); // Normalize to zero-padded format for matching
       const div = document.createElement("div");
       div.className = "well";
       const hasData = wellCounts.hasOwnProperty(normalizedWellId);
@@ -2163,21 +2163,18 @@ function renderPlateGrid() {
         const isControl = isControlWell(wellId);
         
         // Get label from row-based config or content
-        // Try to find the actual well ID in the data (might be different case/format)
+        // Try to find the actual well ID in the data using normalized format
         const firstPlateId = plates[0];
         const wells = allWellsData[firstPlateId] || {};
-        // Try normalized ID first, then original ID, then search for matching well
+        // Try normalized ID first, then search for matching well using normalized format
         let actualWellId = normalizedWellId;
         if (!wells[actualWellId]) {
-          actualWellId = wellId;
-          if (!wells[actualWellId]) {
-            // Search for matching well ID (case-insensitive)
-            const matchingKey = Object.keys(wells).find(key => 
-              key.toUpperCase() === normalizedWellId
-            );
-            if (matchingKey) {
-              actualWellId = matchingKey;
-            }
+          // Search for matching well ID using normalized format
+          const matchingKey = Object.keys(wells).find(key => 
+            normalizeWellId(key) === normalizedWellId
+          );
+          if (matchingKey) {
+            actualWellId = matchingKey;
           }
         }
         const wellData = wells[actualWellId];
@@ -2197,9 +2194,9 @@ function renderPlateGrid() {
         // Count unique datasets that actually have data for this well
         const uniquePlates = plates.filter(plateId => {
           const plateWells = allWellsData[plateId] || {};
-          // Check if this plate has data for this well (try different ID formats)
-          return plateWells[actualWellId] || plateWells[wellId] || 
-                 Object.keys(plateWells).some(key => key.toUpperCase() === normalizedWellId);
+          // Check if this plate has data for this well using normalized format
+          return plateWells[actualWellId] || 
+                 Object.keys(plateWells).some(key => normalizeWellId(key) === normalizedWellId);
         });
         const datasetCount = uniquePlates.length;
         
@@ -2756,6 +2753,17 @@ function getTriplicateGroup(wellId, column) {
     // Groups apply to all columns, so no column check needed
     return groupRowLetters.includes(rowLetter);
   });
+}
+
+function normalizeWellId(wellId) {
+  // Normalize well ID to consistent format: uppercase with zero-padded column (e.g., "B5" -> "B05", "B13" -> "B13")
+  const match = String(wellId).trim().toUpperCase().match(/^([A-Z])(\d+)$/);
+  if (match) {
+    const row = match[1];
+    const col = parseInt(match[2]);
+    return row + String(col).padStart(2, '0');
+  }
+  return String(wellId).trim().toUpperCase();
 }
 
 function getColumnFromWellId(wellId) {
