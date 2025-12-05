@@ -351,6 +351,7 @@ def write_csvs_for_plate(long_df: pd.DataFrame, csv_root: str, config: Dict[str,
     control_rows = config.get("control_rows", ["N", "O"])
     
     # Build mapping: well_id -> triplicate group name
+    # Use normalized well IDs for consistent matching
     well_to_group = {}
     for group in triplicate_groups:
         group_name = group.get("name", "")
@@ -360,9 +361,15 @@ def write_csvs_for_plate(long_df: pd.DataFrame, csv_root: str, config: Dict[str,
             row_letter = well_pattern[0] if well_pattern and well_pattern[0].isalpha() else ""
             if row_letter:
                 # Find all wells in this row across all columns
+                # Normalize well IDs for consistent matching
                 for well_id in long_df["well"].unique():
-                    if well_id and well_id[0] == row_letter:
-                        well_to_group[well_id] = group_name
+                    if well_id:
+                        well_id_str = str(well_id).strip()
+                        normalized_well_id = normalize_well_id(well_id_str)
+                        # Check if normalized well ID starts with the row letter
+                        if normalized_well_id and normalized_well_id[0] == row_letter:
+                            # Store mapping using normalized well ID (consistent format)
+                            well_to_group[normalized_well_id] = group_name
     
     # Per-well CSVs (without SEM - SEM only belongs in triplicate CSVs)
     plate_folder = os.path.join(csv_root, plate_id)
@@ -403,9 +410,13 @@ def write_csvs_for_plate(long_df: pd.DataFrame, csv_root: str, config: Dict[str,
                 continue
             
             # Get all wells in this triplicate group (across all columns)
+            # Use normalized well IDs for consistent matching
             group_wells = []
             for well_id in long_df["well"].unique():
-                if well_id in well_to_group and well_to_group[well_id] == group_name:
+                well_id_str = str(well_id).strip()
+                normalized_well_id = normalize_well_id(well_id_str)
+                # Check using normalized well ID
+                if normalized_well_id in well_to_group and well_to_group[normalized_well_id] == group_name:
                     group_wells.append(well_id)
             
             if not group_wells:
