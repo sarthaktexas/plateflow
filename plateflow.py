@@ -373,7 +373,9 @@ def write_csvs_for_plate(long_df: pd.DataFrame, csv_root: str, config: Dict[str,
     
     # Write per-well CSVs
     for idx, (well_id, g) in enumerate(wells, 1):
-        safe_well = well_id.replace(" ", "").replace(":", "-")
+        # Normalize well ID for consistent file naming
+        normalized_well_id = normalize_well_id(str(well_id).strip())
+        safe_well = normalized_well_id.replace(" ", "").replace(":", "-")
         out_path = os.path.join(plate_folder, f"{plate_id}_{safe_well}.csv")
         g_sorted = g.sort_values("time_s")
         
@@ -494,6 +496,27 @@ def write_default_config(config_path: str):
         print(f"  Generated default configuration file: {os.path.basename(config_path)}", flush=True)
     except Exception as e:
         print(f"  Warning: Could not write default config file: {e}", flush=True)
+
+
+def normalize_well_id(well_id: str) -> str:
+    """
+    Normalize well ID to consistent format: uppercase with zero-padded column.
+    Examples: "B5" -> "B05", "B13" -> "B13", "b5" -> "B05"
+    """
+    if not well_id:
+        return ""
+    
+    well_id = str(well_id).strip().upper()
+    
+    # Match pattern: letter followed by digits
+    import re
+    match = re.match(r'^([A-Z])(\d+)$', well_id)
+    if match:
+        row = match.group(1)
+        col = int(match.group(2))
+        return f"{row}{col:02d}"  # Zero-pad to 2 digits
+    
+    return well_id
 
 
 def load_config(config_path: str) -> Dict[str, Any]:
@@ -718,7 +741,8 @@ def build_viewer_json(all_plates: Dict[str, pd.DataFrame], json_path: str, confi
         # Get all unique well IDs from this plate
         unique_wells = df["well"].unique()
         for well_id in unique_wells:
-            well_id_str = str(well_id).strip()
+            # Normalize well ID for consistent duplicate detection
+            well_id_str = normalize_well_id(str(well_id).strip())
             if well_id_str not in well_id_to_files:
                 well_id_to_files[well_id_str] = []
             if filename not in well_id_to_files[well_id_str]:
@@ -770,13 +794,15 @@ def build_viewer_json(all_plates: Dict[str, pd.DataFrame], json_path: str, confi
     for plate_id, df in all_plates.items():
         wells_dict: Dict[str, Any] = {}
         for well_id, g in df.groupby("well"):
+            # Normalize well ID to consistent format (zero-padded)
+            normalized_well_id = normalize_well_id(well_id)
             g_sorted = g.sort_values("time_s")
             content = g_sorted["content"].iloc[0]
             # Use row-based label from config if available, otherwise use content
-            # Extract row letter from well_id (e.g., "B13" -> "B")
-            row_letter = well_id[0] if well_id and well_id[0].isalpha() else ""
+            # Extract row letter from normalized well_id (e.g., "B13" -> "B")
+            row_letter = normalized_well_id[0] if normalized_well_id and normalized_well_id[0].isalpha() else ""
             label = well_labels.get(row_letter, content) if row_letter else content
-            wells_dict[well_id] = {
+            wells_dict[normalized_well_id] = {
                 "content": content,
                 "label": label,
                 "time_s": g_sorted["time_s"].tolist(),
