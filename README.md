@@ -269,8 +269,7 @@ The AppleScript:
 2. Replace the `pythonCodeBase64` variable in the AppleScript
 
 How do I do that?
-1. `base64 -i plate_viewer.py > /tmp/python_base64.txt`
-2. `awk -v new_b64="$NEW_B64" 'NR==84 {print "\t\tset pythonCodeBase64 to \"" new_b64 "\""; next} {print}' run_plate_viewer.applescript > /tmp/updated_applescript.applescript && mv /tmp/updated_applescript.applescript run_plate_viewer.applescript`
+`base64 < plate_viewer.py > /tmp/python_base64.txt && awk -v base64_file="/tmp/python_base64.txt" 'NR==84 {getline base64_content < base64_file; close(base64_file); gsub(/"/, "\\\"", base64_content); print "\t\tset pythonCodeBase64 to \"" base64_content "\""; next} {print}' run_plate_viewer.applescript > /tmp/updated_applescript.applescript && mv /tmp/updated_applescript.applescript run_`
 
 ## Output Files
 
