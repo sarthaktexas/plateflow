@@ -323,11 +323,42 @@ def ensure_dir(path: str):
     os.makedirs(path, exist_ok=True)
 
 
-def write_csvs_for_plate(long_df: pd.DataFrame, csv_root: str, config: Dict[str, Any] = None, filename: str = None):
+def write_csvs_for_plate(
+    long_df: pd.DataFrame, 
+    csv_root: str, 
+    config: Dict[str, Any] = None, 
+    filename: str = None,
+    baseline_end_time: float = 20.0,
+    baseline_method: str = 'constant',
+    baseline_frac: float = 0.5,
+    baseline_poly_order: int = 1,
+    normalization_mode: str = 'multiplicative'
+):
     """
     Write CSV files:
-      - csv_root/<plate_id>/<plate_id>_<well>.csv (per well, without SEM)
-      - csv_root/<condition>_<triplicate_name>.csv (per condition-triplicate combination, with mean and SEM)
+      - csv_root/<plate_id>/<plate_id>_<well>.csv (per well, normalized values with baseline)
+      - csv_root/<condition>_<triplicate_name>.csv (per condition-triplicate combination, using normalized values with mean and SEM)
+    
+    Parameters:
+    -----------
+    long_df : pd.DataFrame
+        Long-format DataFrame with columns ['plate_id', 'well', 'content', 'time_s', 'value']
+    csv_root : str
+        Root directory for CSV output
+    config : Dict[str, Any], optional
+        Configuration dictionary
+    filename : str, optional
+        Source filename for parsing column info
+    baseline_end_time : float
+        Maximum time (in seconds) for baseline window (default: 24.0)
+    baseline_method : str
+        Baseline fitting method: 'lowess', 'constant', or 'polynomial' (default: 'constant')
+    baseline_frac : float
+        Fraction of data used for LOWESS smoothing (default: 0.5)
+    baseline_poly_order : int
+        Polynomial order for polynomial fit (default: 1)
+    normalization_mode : str
+        Normalization mode: 'delta_f_over_f' or 'multiplicative' (default: 'multiplicative')
     """
     plate_id = long_df["plate_id"].iloc[0]
     print(f"  Writing CSVs for {plate_id}...", flush=True)
@@ -337,6 +368,31 @@ def write_csvs_for_plate(long_df: pd.DataFrame, csv_root: str, config: Dict[str,
         script_dir = os.path.dirname(os.path.abspath(__file__))
         config_path = os.path.join(script_dir, "plate_config.json")
         config = load_config(config_path)
+    
+    # Filter out bad wells before processing
+    bad_wells_list = config.get("bad_wells", [])
+    if bad_wells_list:
+        original_count = len(long_df)
+        long_df = long_df[~long_df["well"].apply(lambda w: is_bad_well(w, config))]
+        filtered_count = len(long_df)
+        if original_count != filtered_count:
+            print(f"    Excluding {original_count - filtered_count} data points from bad wells", flush=True)
+    
+    # Normalize data with baseline before writing CSVs
+    print(f"    Normalizing data with baseline (method={baseline_method}, mode={normalization_mode})...", flush=True)
+    baseline_fits = fit_well_baselines(
+        long_df,
+        baseline_end_time=baseline_end_time,
+        method=baseline_method,
+        frac=baseline_frac,
+        poly_order=baseline_poly_order,
+        config=config
+    )
+    norm_df = normalize_wells(long_df, baseline_fits, normalization_mode=normalization_mode)
+    # Add normalized well ID column for consistent matching
+    norm_df = norm_df.copy()
+    norm_df["well_normalized"] = norm_df["well"].apply(lambda w: normalize_well_id(str(w).strip()))
+    print(f"    ✓ Normalized {len(norm_df)} data points", flush=True)
     
     # Parse column info from filename if provided
     column_info = None
@@ -361,24 +417,22 @@ def write_csvs_for_plate(long_df: pd.DataFrame, csv_root: str, config: Dict[str,
             row_letter = well_pattern[0] if well_pattern and well_pattern[0].isalpha() else ""
             if row_letter:
                 # Find all wells in this row across all columns
-                # Normalize well IDs for consistent matching
-                for well_id in long_df["well"].unique():
-                    if well_id:
-                        well_id_str = str(well_id).strip()
-                        normalized_well_id = normalize_well_id(well_id_str)
+                # Use well_normalized column for consistent matching
+                for normalized_well_id in norm_df["well_normalized"].unique():
+                    if normalized_well_id:
                         # Check if normalized well ID starts with the row letter
                         if normalized_well_id and normalized_well_id[0] == row_letter:
                             # Store mapping using normalized well ID (consistent format)
                             well_to_group[normalized_well_id] = group_name
     
-    # Per-well CSVs (without SEM - SEM only belongs in triplicate CSVs)
+    # Per-well CSVs (normalized values with baseline, without SEM - SEM only belongs in triplicate CSVs)
     plate_folder = os.path.join(csv_root, plate_id)
     ensure_dir(plate_folder)
     
-    wells = long_df.groupby("well")
-    print(f"    Writing {len(wells)} per-well CSVs...", flush=True)
+    wells = norm_df.groupby("well")
+    print(f"    Writing {len(wells)} per-well CSVs (normalized values)...", flush=True)
     
-    # Write per-well CSVs
+    # Write per-well CSVs with normalized values
     for idx, (well_id, g) in enumerate(wells, 1):
         # Normalize well ID for consistent file naming
         normalized_well_id = normalize_well_id(str(well_id).strip())
@@ -386,10 +440,10 @@ def write_csvs_for_plate(long_df: pd.DataFrame, csv_root: str, config: Dict[str,
         out_path = os.path.join(plate_folder, f"{plate_id}_{safe_well}.csv")
         g_sorted = g.sort_values("time_s")
         
-        # Create output DataFrame with time and value only (no SEM)
+        # Create output DataFrame with time and normalized value only (no SEM)
         output_df = pd.DataFrame({
             "time_s": g_sorted["time_s"].values,
-            "value": g_sorted["value"].values
+            "value": g_sorted["value"].values  # This is now normalized
         })
         output_df.to_csv(out_path, index=False)
         
@@ -398,8 +452,9 @@ def write_csvs_for_plate(long_df: pd.DataFrame, csv_root: str, config: Dict[str,
     
     # Write condition-specific CSVs (genotype-buffer-triplicate)
     # One CSV per condition-triplicate-column combination
+    # Using normalized values from norm_df
     if column_info:
-        print(f"    Writing condition-specific CSVs...", flush=True)
+        print(f"    Writing condition-specific CSVs (using normalized values)...", flush=True)
         genotype = column_info.get("genotype", "")
         buffer = column_info.get("buffer", "")
         
@@ -412,25 +467,25 @@ def write_csvs_for_plate(long_df: pd.DataFrame, csv_root: str, config: Dict[str,
             # Get all wells in this triplicate group (across all columns)
             # Use normalized well IDs for consistent matching
             group_wells = []
-            for well_id in long_df["well"].unique():
-                well_id_str = str(well_id).strip()
-                normalized_well_id = normalize_well_id(well_id_str)
+            for normalized_well_id in norm_df["well_normalized"].unique():
                 # Check using normalized well ID
                 if normalized_well_id in well_to_group and well_to_group[normalized_well_id] == group_name:
-                    group_wells.append(well_id)
+                    # Store normalized well ID for consistency
+                    group_wells.append(normalized_well_id)
             
             if not group_wells:
                 continue
             
             # Group wells by column number
+            # Note: group_wells now contains normalized well IDs
             wells_by_column = {}
-            for well_id in group_wells:
-                # Extract column number from well ID (e.g., "B13" -> 13)
+            for normalized_well_id in group_wells:
+                # Extract column number from normalized well ID (e.g., "B13" -> 13, "B05" -> 5)
                 try:
-                    column_num = int(''.join(filter(str.isdigit, str(well_id))))
+                    column_num = int(''.join(filter(str.isdigit, str(normalized_well_id))))
                     if column_num not in wells_by_column:
                         wells_by_column[column_num] = []
-                    wells_by_column[column_num].append(well_id)
+                    wells_by_column[column_num].append(normalized_well_id)
                 except (ValueError, AttributeError):
                     continue
             
@@ -438,17 +493,24 @@ def write_csvs_for_plate(long_df: pd.DataFrame, csv_root: str, config: Dict[str,
             for column_num in sorted(wells_by_column.keys()):
                 column_wells = wells_by_column[column_num]
                 
-                # Get all time points for this column's wells
-                all_times = sorted(long_df[long_df["well"].isin(column_wells)]["time_s"].unique())
+                # Get all time points for this column's wells (using normalized data)
+                # column_wells contains normalized well IDs, use well_normalized column for matching
+                # Filter out bad wells from column_wells
+                column_wells_filtered = [w for w in column_wells if not is_bad_well(w, config)]
+                if not column_wells_filtered:
+                    continue  # Skip this column if all wells are bad
+                
+                all_times = sorted(norm_df[norm_df["well_normalized"].isin(column_wells_filtered)]["time_s"].unique())
                 
                 # Calculate mean and SEM for each time point across wells in this triplicate group for this column
+                # Using normalized values
                 mean_values = []
                 sem_values = []
                 
                 for time in all_times:
                     values_at_time = []
-                    for well_id in column_wells:
-                        well_data = long_df[(long_df["well"] == well_id) & (long_df["time_s"] == time)]
+                    for normalized_well_id in column_wells_filtered:
+                        well_data = norm_df[(norm_df["well_normalized"] == normalized_well_id) & (norm_df["time_s"] == time)]
                         if not well_data.empty:
                             values_at_time.append(well_data["value"].iloc[0])
                     
@@ -472,7 +534,7 @@ def write_csvs_for_plate(long_df: pd.DataFrame, csv_root: str, config: Dict[str,
                 safe_group_name = group_name.replace(" ", "_").replace(":", "-")
                 condition_path = os.path.join(csv_root, f"{plate_id}_{safe_group_name}_col{column_num}.csv")
                 
-                # Write condition CSV
+                # Write condition CSV with normalized values
                 condition_df = pd.DataFrame({
                     "time_s": all_times,
                     "mean": mean_values,
@@ -498,7 +560,8 @@ def write_default_config(config_path: str):
     default_config = {
         "well_labels": well_labels,
         "triplicate_groups": DEFAULT_TRIPLICATE_GROUPS,
-        "control_rows": ["N", "O"]
+        "control_rows": ["N", "O"],
+        "bad_wells": []
     }
     
     try:
@@ -528,6 +591,43 @@ def normalize_well_id(well_id: str) -> str:
         return f"{row}{col:02d}"  # Zero-pad to 2 digits
     
     return well_id
+
+
+def is_bad_well(well_id: str, config: Dict[str, Any] = None) -> bool:
+    """
+    Check if a well is in the bad_wells list from config.
+    
+    Parameters:
+    -----------
+    well_id : str
+        Well ID to check (e.g., "B13", "B05")
+    config : Dict[str, Any], optional
+        Configuration dictionary. If None, loads from plate_config.json
+    
+    Returns:
+    --------
+    bool
+        True if the well is in the bad_wells list, False otherwise
+    """
+    if config is None:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        config_path = os.path.join(script_dir, "plate_config.json")
+        config = load_config(config_path)
+    
+    bad_wells = config.get("bad_wells", [])
+    if not isinstance(bad_wells, list):
+        return False
+    
+    # Normalize the input well ID for consistent matching
+    normalized_well_id = normalize_well_id(str(well_id).strip())
+    
+    # Check if normalized well ID matches any bad well (normalize bad wells too)
+    for bad_well in bad_wells:
+        normalized_bad_well = normalize_well_id(str(bad_well).strip())
+        if normalized_well_id == normalized_bad_well:
+            return True
+    
+    return False
 
 
 def load_config(config_path: str) -> Dict[str, Any]:
@@ -807,6 +907,11 @@ def build_viewer_json(all_plates: Dict[str, pd.DataFrame], json_path: str, confi
         for well_id, g in df.groupby("well"):
             # Normalize well ID to consistent format (zero-padded)
             normalized_well_id = normalize_well_id(well_id)
+            
+            # Skip bad wells
+            if is_bad_well(normalized_well_id, config):
+                continue
+            
             g_sorted = g.sort_values("time_s")
             content = g_sorted["content"].iloc[0]
             # Use row-based label from config if available, otherwise use content
@@ -1946,11 +2051,14 @@ function renderWellSelectorGrid() {
     // Wells
     for (let col = 1; col <= PLATE_COLS; col++) {
       const wellId = rowLetter + String(col);
+      const normalizedWellId = normalizeWellId(wellId);
       const cell = document.createElement("div");
       cell.className = "well-selector-cell";
       
-      const hasData = allWellsSet.has(wellId);
-      const isExcluded = enabledWells.size > 0 && !enabledWells.has(wellId);
+      // Check for data using normalized ID (since allWellsData contains normalized IDs)
+      const hasData = allWellsSet.has(normalizedWellId) || allWellsSet.has(wellId);
+      // Check exclusion using both normalized and non-normalized IDs
+      const isExcluded = enabledWells.size > 0 && !enabledWells.has(normalizedWellId) && !enabledWells.has(wellId);
       
       if (hasData) {
         cell.classList.add("has-data");
@@ -1968,7 +2076,7 @@ function renderWellSelectorGrid() {
         }
         
         cell.addEventListener("click", () => {
-          toggleWellExclusion(wellId);
+          toggleWellExclusion(normalizedWellId);
         });
       } else {
         cell.style.background = "#f2f2f2";
@@ -1982,6 +2090,10 @@ function renderWellSelectorGrid() {
 }
 
 function toggleWellExclusion(wellId) {
+  // Normalize the incoming well ID to ensure consistent comparison
+  // wellId may already be normalized, but normalize it to be safe
+  const normalizedWellId = normalizeWellId(wellId);
+  
   if (enabledWells.size === 0) {
     // If no exclusions yet, first collect all available wells
     const selectedDatasets = getSelectedDatasets();
@@ -1989,21 +2101,29 @@ function toggleWellExclusion(wellId) {
     selectedDatasets.forEach(plateId => {
       const wells = allWellsData[plateId] || {};
       Object.keys(wells).forEach(wId => {
-        allWellsSet.add(wId);
+        // All well IDs in allWellsData are already normalized, but normalize to be safe
+        const normalizedWId = normalizeWellId(wId);
+        allWellsSet.add(normalizedWId);
       });
     });
-    // Enable all except the one being clicked
+    // Enable all except the one being clicked (using normalized ID)
     allWellsSet.forEach(wId => {
-      if (wId !== wellId) {
+      if (wId !== normalizedWellId) {
         enabledWells.add(wId);
       }
     });
   } else {
-    // Toggle this specific well
-    if (enabledWells.has(wellId)) {
+    // Toggle this specific well (check both normalized and non-normalized for backward compatibility)
+    const hasNormalized = enabledWells.has(normalizedWellId);
+    const hasOriginal = enabledWells.has(wellId);
+    
+    if (hasNormalized || hasOriginal) {
+      // Remove both normalized and non-normalized versions if present
+      enabledWells.delete(normalizedWellId);
       enabledWells.delete(wellId);
     } else {
-      enabledWells.add(wellId);
+      // Add normalized version
+      enabledWells.add(normalizedWellId);
     }
     
     // If all wells are enabled, clear the set (meaning all are enabled)
@@ -2012,14 +2132,21 @@ function toggleWellExclusion(wellId) {
     selectedDatasets.forEach(plateId => {
       const wells = allWellsData[plateId] || {};
       Object.keys(wells).forEach(wId => {
-        allWellsSet.add(wId);
+        // Normalize all well IDs for consistent comparison
+        const normalizedWId = normalizeWellId(wId);
+        allWellsSet.add(normalizedWId);
       });
     });
     
-    // Check if all wells are enabled
+    // Check if all wells are enabled (check both normalized and non-normalized for backward compatibility)
     let allEnabled = true;
-    allWellsSet.forEach(wId => {
-      if (!enabledWells.has(wId)) {
+    allWellsSet.forEach(normalizedWId => {
+      // Check both normalized and original format
+      const originalWId = normalizedWId.replace(/^([A-Z])(\d{2})$/, (match, row, col) => {
+        const colNum = parseInt(col);
+        return row + String(colNum);
+      });
+      if (!enabledWells.has(normalizedWId) && !enabledWells.has(originalWId)) {
         allEnabled = false;
       }
     });
@@ -2295,21 +2422,24 @@ function renderPlateGrid() {
           // Check if any well in this triplicate group (same row pattern, same column) is selected
           const groupRowLetters = getRowLettersFromWells(triplicateGroup.wells);
           selectedDatasets.forEach(plateId => {
+            if (!plates.includes(plateId)) {
+              return;
+            }
             groupRowLetters.forEach(rowLetter => {
               const wId = rowLetter + column;
-              if (plates.includes(plateId)) {
-                const key = `${plateId}:${wId}`;
-                if (selectedWells.has(key)) {
-                  isSelected = true;
-                }
+              const normalizedWId = normalizeWellId(wId);
+              const key = `${plateId}:${normalizedWId}`;
+              if (selectedWells.has(key)) {
+                isSelected = true;
               }
             });
           });
         } else {
           // Check if this specific well is selected
+          const normalizedWellId = normalizeWellId(wellId);
           isSelected = selectedDatasets.some(plateId => {
             if (plates.includes(plateId)) {
-              const key = `${plateId}:${wellId}`;
+              const key = `${plateId}:${normalizedWellId}`;
               return selectedWells.has(key);
             }
             return false;
@@ -2518,11 +2648,12 @@ function toggleWellSelection(wellId, plateIds) {
   
   // Control wells: allow individual selection (can select each well separately)
   if (isControl) {
+    const normalizedWellId = normalizeWellId(wellId);
     // Check if this specific control well is already selected
     let isSelected = false;
     selectedDatasets.forEach(plateId => {
       if (plateIds.includes(plateId)) {
-        const key = `${plateId}:${wellId}`;
+        const key = `${plateId}:${normalizedWellId}`;
         if (selectedWells.has(key)) {
           isSelected = true;
         }
@@ -2534,11 +2665,16 @@ function toggleWellSelection(wellId, plateIds) {
     selectedDatasets.forEach(plateId => {
       // Only toggle if this plate has data for this well
       if (plateIds.includes(plateId)) {
+        const wells = allWellsData[plateId] || {};
+        const hasData = wells[normalizedWellId] || wells[wellId];
+        if (!hasData) {
+          return; // Skip if no data
+        }
         // Filter by enabledWells if any are set
-        if (enabledWells.size > 0 && !enabledWells.has(wellId)) {
+        if (enabledWells.size > 0 && !enabledWells.has(wellId) && !enabledWells.has(normalizedWellId)) {
           return; // Skip excluded wells
         }
-        const key = `${plateId}:${wellId}`;
+        const key = `${plateId}:${normalizedWellId}`;
         if (isSelected) {
           selectedWells.delete(key);
         } else {
@@ -2560,20 +2696,22 @@ function toggleWellSelection(wellId, plateIds) {
   if (isDuplicateWell(wellId)) {
     // Find all datasets that have this well
     const allGroupDatasets = getAllDatasetsInGroup();
+    const normalizedWellId = normalizeWellId(wellId);
     const datasetsWithWell = allGroupDatasets.filter(plateId => {
-      return allWellsData[plateId] && allWellsData[plateId][wellId];
+      const wells = allWellsData[plateId] || {};
+      return wells[normalizedWellId] || wells[wellId];
     });
     
     // Check if any dataset for this well is already selected
     let isAnySelected = datasetsWithWell.some(plateId => {
-      const key = `${plateId}:${wellId}`;
+      const key = `${plateId}:${normalizedWellId}`;
       return selectedWells.has(key);
     });
     
     // Toggle all datasets for this duplicate well
     let anyChanged = false;
     datasetsWithWell.forEach(plateId => {
-      const key = `${plateId}:${wellId}`;
+      const key = `${plateId}:${normalizedWellId}`;
       if (isAnySelected) {
         selectedWells.delete(key);
       } else {
@@ -2604,10 +2742,12 @@ function toggleWellSelection(wellId, plateIds) {
     let totalCount = 0;
     
     selectedDatasets.forEach(plateId => {
+      const wells = allWellsData[plateId] || {};
       groupRowLetters.forEach(rowLetter => {
         const wId = rowLetter + column;
-        const key = `${plateId}:${wId}`;
-        const hasData = allWellsData[plateId] && allWellsData[plateId][wId];
+        const normalizedWId = normalizeWellId(wId);
+        const key = `${plateId}:${normalizedWId}`;
+        const hasData = wells[normalizedWId] || wells[wId];
         if (hasData) {
           totalCount++;
           if (selectedWells.has(key)) {
@@ -2622,9 +2762,10 @@ function toggleWellSelection(wellId, plateIds) {
     isGroupSelected = selectedCount > 0;
   } else {
     // For non-triplicate wells, check if this specific well is selected
+    const normalizedWellId = normalizeWellId(wellId);
     selectedDatasets.forEach(plateId => {
       if (plateIds.includes(plateId)) {
-        const key = `${plateId}:${wellId}`;
+        const key = `${plateId}:${normalizedWellId}`;
         if (selectedWells.has(key)) {
           isGroupSelected = true;
         }
@@ -2639,13 +2780,15 @@ function toggleWellSelection(wellId, plateIds) {
     
     // Toggle all wells in the triplicate group (same row pattern, same column) across all selected datasets
     selectedDatasets.forEach(plateId => {
+      const wells = allWellsData[plateId] || {};
       groupRowLetters.forEach(rowLetter => {
         const wId = rowLetter + column;
-        const key = `${plateId}:${wId}`;
-        const hasData = allWellsData[plateId] && allWellsData[plateId][wId];
+        const normalizedWId = normalizeWellId(wId);
+        const key = `${plateId}:${normalizedWId}`;
+        const hasData = wells[normalizedWId] || wells[wId];
         if (hasData) {
           // Filter by enabledWells if any are set
-          if (enabledWells.size > 0 && !enabledWells.has(wId)) {
+          if (enabledWells.size > 0 && !enabledWells.has(wId) && !enabledWells.has(normalizedWId)) {
             return; // Skip excluded wells
           }
           if (isGroupSelected) {
@@ -2659,14 +2802,20 @@ function toggleWellSelection(wellId, plateIds) {
     });
   } else {
     // Toggle individual well across all selected datasets
+    const normalizedWellId = normalizeWellId(wellId);
     selectedDatasets.forEach(plateId => {
       // Only toggle if this plate has data for this well
       if (plateIds.includes(plateId)) {
+        const wells = allWellsData[plateId] || {};
+        const hasData = wells[normalizedWellId] || wells[wellId];
+        if (!hasData) {
+          return; // Skip if no data
+        }
         // Filter by enabledWells if any are set
-        if (enabledWells.size > 0 && !enabledWells.has(wellId)) {
+        if (enabledWells.size > 0 && !enabledWells.has(wellId) && !enabledWells.has(normalizedWellId)) {
           return; // Skip excluded wells
         }
-        const key = `${plateId}:${wellId}`;
+        const key = `${plateId}:${normalizedWellId}`;
         if (isGroupSelected) {
           selectedWells.delete(key);
         } else {
@@ -3818,12 +3967,14 @@ function updateChart() {
       }
       
       // Filter by enabledWells if any are set
-      if (enabledWells.size > 0 && !enabledWells.has(wellId)) {
+      const normalizedWellId = normalizeWellId(wellId);
+      if (enabledWells.size > 0 && !enabledWells.has(wellId) && !enabledWells.has(normalizedWellId)) {
         return;
       }
       
-      if (allWellsData[plateId] && allWellsData[plateId][wellId]) {
-        const wellData = allWellsData[plateId][wellId];
+      const wells = allWellsData[plateId] || {};
+      const wellData = wells[normalizedWellId] || wells[wellId];
+      if (wellData) {
         const plate = viewerData.plates.find(p => p.id === plateId);
         const filename = plate ? (plate.file || plate.id) : plateId;
         const config = viewerData.config || {};
@@ -3878,7 +4029,8 @@ function updateChart() {
     }
     
     // Filter by enabledWells if any are set (exclude wells)
-    if (enabledWells.size > 0 && !enabledWells.has(wellId)) {
+    const normalizedWellId = normalizeWellId(wellId);
+    if (enabledWells.size > 0 && !enabledWells.has(wellId) && !enabledWells.has(normalizedWellId)) {
       return; // Skip excluded wells
     }
     
@@ -3924,16 +4076,20 @@ function updateChart() {
     Array.from(selectedWells).forEach(key => {
       const [plateId, wellId] = key.split(":");
       const column = getColumnFromWellId(wellId);
-      if (groupInfo.wellIds.has(wellId) && column === groupInfo.column) {
+      const normalizedWellId = normalizeWellId(wellId);
+      // Check if this well is in the group (using normalized ID)
+      const normalizedWellIdsForColumn = Array.from(groupInfo.wellIds).map(w => normalizeWellId(w));
+      if (normalizedWellIdsForColumn.includes(normalizedWellId) && column === groupInfo.column) {
         const wells = allWellsData[plateId] || {};
-        if (wells[wellId]) {
+        const wellData = wells[normalizedWellId] || wells[wellId];
+        if (wellData) {
           // Check if already added
           const exists = groupedSelections[groupKey].wells.some(
             w => w.wellId === wellId && w.plateId === plateId
           );
           if (!exists) {
             // STEP 1: Apply normalization using fitted baseline if enabled (must happen before grouping)
-            let processedWellData = wells[wellId];
+            let processedWellData = wellData;
             if (normalizeBaseline) {
               processedWellData = normalizeWithFittedBaseline(
                 processedWellData,
@@ -3985,7 +4141,8 @@ function updateChart() {
     }
     
     // Filter by enabledWells if any are set
-    if (enabledWells.size > 0 && !enabledWells.has(wellId)) {
+    const normalizedWellId = normalizeWellId(wellId);
+    if (enabledWells.size > 0 && !enabledWells.has(wellId) && !enabledWells.has(normalizedWellId)) {
       return; // Skip excluded wells
     }
     
@@ -3999,8 +4156,10 @@ function updateChart() {
       let label = wellLabels[rowLetter];
       if (!label) {
         for (const pId of selectedDatasets) {
-          if (allWellsData[pId] && allWellsData[pId][wellId]) {
-            label = allWellsData[pId][wellId].label || allWellsData[pId][wellId].content || `Well ${wellId}`;
+          const wells = allWellsData[pId] || {};
+          const wellData = wells[normalizedWellId] || wells[wellId];
+          if (wellData) {
+            label = wellData.label || wellData.content || `Well ${wellId}`;
             break;
           }
         }
@@ -4013,11 +4172,13 @@ function updateChart() {
     }
     
     // Add this well's data if it exists
-    if (allWellsData[plateId] && allWellsData[plateId][wellId]) {
+    const wells = allWellsData[plateId] || {};
+    const wellData = wells[normalizedWellId] || wells[wellId];
+    if (wellData) {
       const existing = groupedSelections[groupKey].wells.find(w => w.wellId === wellId && w.plateId === plateId);
       if (!existing) {
           // STEP 1: Apply normalization using fitted baseline if enabled (must happen before grouping)
-          let processedWellData = allWellsData[plateId][wellId];
+          let processedWellData = wellData;
           if (normalizeBaseline) {
             processedWellData = normalizeWithFittedBaseline(
               processedWellData,
@@ -4798,7 +4959,8 @@ def fit_well_baselines(
     baseline_end_time: float = 24.0,
     method: str = 'lowess',
     frac: float = 0.5,
-    poly_order: int = 1
+    poly_order: int = 1,
+    config: Dict[str, Any] = None
 ) -> Dict[str, pd.Series]:
     """
     For each well, fit a smooth baseline function on the baseline window ONLY,
@@ -4823,6 +4985,12 @@ def fit_well_baselines(
         Dictionary mapping well_id to Series of fitted baseline values (indexed by time_s)
     """
     baseline_fits = {}
+    
+    # Filter out bad wells if config is provided
+    if config is not None:
+        bad_wells_list = config.get("bad_wells", [])
+        if bad_wells_list:
+            df = df[~df["well"].apply(lambda w: is_bad_well(w, config))]
     
     # Get baseline windows for each well
     baseline_windows = identify_baseline_window(df, baseline_end_time)
@@ -4857,28 +5025,45 @@ def fit_well_baselines(
         )
         
         # Extrapolate to full timecourse
-        # Interpolate baseline fit to all timepoints in full timecourse
-        from scipy.interpolate import interp1d
-        
-        # Get unique timepoints from baseline fit
-        baseline_times = baseline_fit.index.values
-        baseline_values = baseline_fit.values
-        
-        # Create interpolation function
-        interp_func = interp1d(
-            baseline_times,
-            baseline_values,
-            kind='linear',
-            bounds_error=False,
-            fill_value='extrapolate'
-        )
-        
-        # Interpolate to full timecourse timepoints
         full_times = full_timecourse['time_s'].values
-        extrapolated_baseline = pd.Series(
-            interp_func(full_times),
-            index=full_timecourse['time_s']
-        )
+        
+        # For constant method, we can create the Series directly without scipy
+        if method == 'constant':
+            # baseline_fit already contains the constant value
+            constant_value = baseline_fit.iloc[0] if len(baseline_fit) > 0 else np.nan
+            extrapolated_baseline = pd.Series(
+                constant_value,
+                index=full_timecourse['time_s']
+            )
+        else:
+            # For polynomial and lowess methods, need interpolation
+            try:
+                from scipy.interpolate import interp1d
+            except ImportError:
+                raise ImportError(
+                    "scipy is required for baseline methods 'polynomial' and 'lowess'. "
+                    "Install with: pip install scipy\n"
+                    "Or use method='constant' which does not require scipy."
+                )
+            
+            # Get unique timepoints from baseline fit
+            baseline_times = baseline_fit.index.values
+            baseline_values = baseline_fit.values
+            
+            # Create interpolation function
+            interp_func = interp1d(
+                baseline_times,
+                baseline_values,
+                kind='linear',
+                bounds_error=False,
+                fill_value='extrapolate'
+            )
+            
+            # Interpolate to full timecourse timepoints
+            extrapolated_baseline = pd.Series(
+                interp_func(full_times),
+                index=full_timecourse['time_s']
+            )
         
         baseline_fits[well_id] = extrapolated_baseline
     
@@ -5311,6 +5496,21 @@ def process_baseline_normalization(
     print("=" * 70)
     print()
     
+    # Load config if not provided
+    if config is None:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        config_path = os.path.join(script_dir, "plate_config.json")
+        config = load_config(config_path)
+    
+    # Filter out bad wells before processing
+    bad_wells_list = config.get("bad_wells", [])
+    if bad_wells_list:
+        original_count = len(df)
+        df = df[~df["well"].apply(lambda w: is_bad_well(w, config))]
+        filtered_count = len(df)
+        if original_count != filtered_count:
+            print(f"Excluding {original_count - filtered_count} data points from bad wells", flush=True)
+    
     print("Step 1: Identifying baseline windows...", flush=True)
     baseline_windows = identify_baseline_window(df, baseline_end_time)
     print(f"  Identified baseline windows for {len(baseline_windows)} wells", flush=True)
@@ -5323,7 +5523,8 @@ def process_baseline_normalization(
         baseline_end_time=baseline_end_time,
         method=baseline_method,
         frac=baseline_frac,
-        poly_order=baseline_poly_order
+        poly_order=baseline_poly_order,
+        config=config
     )
     print(f"  Fitted baselines for {len(baseline_fits)} wells", flush=True)
     
@@ -5369,10 +5570,219 @@ def process_baseline_normalization(
     return norm_df, stats_df, baseline_fits
 
 
+def prompt_baseline_settings():
+    """
+    Prompt user for baseline and normalization settings.
+    Returns a tuple of (baseline_end_time, baseline_method, baseline_frac, baseline_poly_order, normalization_mode)
+    
+    If stdin is not available (non-interactive mode) or command-line arguments are provided,
+    returns default values or values from command-line arguments.
+    
+    Command-line arguments (optional):
+        --baseline-end-time FLOAT
+        --baseline-method {constant|lowess|polynomial}
+        --baseline-frac FLOAT (for LOWESS)
+        --baseline-poly-order INT (for polynomial)
+        --normalization-mode {multiplicative|delta_f_over_f}
+    """
+    import argparse
+    
+    # Parse command-line arguments first
+    parser = argparse.ArgumentParser(add_help=False)  # Don't show help, we'll handle prompts
+    parser.add_argument('--baseline-end-time', type=float, default=None)
+    parser.add_argument('--baseline-method', type=str, choices=['constant', 'lowess', 'polynomial'], default=None)
+    parser.add_argument('--baseline-frac', type=float, default=None)
+    parser.add_argument('--baseline-poly-order', type=int, default=None)
+    parser.add_argument('--normalization-mode', type=str, choices=['multiplicative', 'delta_f_over_f'], default=None)
+    
+    # Parse known args only (ignore unknown args that might be used elsewhere)
+    args, _ = parser.parse_known_args()
+    
+    # If all settings provided via command-line, use them (non-interactive)
+    if all([args.baseline_end_time is not None, args.baseline_method is not None, 
+            args.normalization_mode is not None]):
+        baseline_end_time = args.baseline_end_time
+        baseline_method = args.baseline_method
+        baseline_frac = args.baseline_frac if args.baseline_frac is not None else 0.5
+        baseline_poly_order = args.baseline_poly_order if args.baseline_poly_order is not None else 1
+        
+        print("\n✓ Using command-line settings:")
+        print(f"  Baseline window end time: {baseline_end_time} s")
+        print(f"  Baseline method: {baseline_method}")
+        if baseline_method == 'lowess':
+            print(f"  LOWESS smoothing fraction: {baseline_frac}")
+        elif baseline_method == 'polynomial':
+            print(f"  Polynomial order: {baseline_poly_order}")
+        print(f"  Normalization mode: {args.normalization_mode}\n")
+        return baseline_end_time, baseline_method, baseline_frac, baseline_poly_order, args.normalization_mode
+    
+    # Check if stdin is available (interactive mode)
+    if not sys.stdin.isatty():
+        print("\n⚠️  Running in non-interactive mode. Using default settings:")
+        print("  Baseline window end time: 24.0 s")
+        print("  Baseline method: constant")
+        print("  Normalization mode: multiplicative\n")
+        return 24.0, 'constant', 0.5, 1, 'multiplicative'
+    
+    print("\n" + "=" * 70)
+    print("BASELINE AND NORMALIZATION SETTINGS")
+    print("=" * 70)
+    print("\nThese settings will be used for CSV generation and normalization.")
+    print("You can change them later in the web interface for visualization.")
+    print("(Press Enter to accept defaults)\n")
+    
+    # Prompt for baseline end time (use command-line arg if provided)
+    baseline_end_time = None
+    if args.baseline_end_time is not None:
+        baseline_end_time = args.baseline_end_time
+        print(f"Baseline window end time: {baseline_end_time} s (from command-line)")
+    else:
+        while True:
+            try:
+                baseline_input = input("Baseline window end time (seconds) [default: 24.0]: ").strip()
+                if not baseline_input:
+                    baseline_end_time = 24.0
+                else:
+                    baseline_end_time = float(baseline_input)
+                    if baseline_end_time <= 0:
+                        print("  ⚠️  Please enter a positive number.")
+                        continue
+                break
+            except (ValueError, EOFError, KeyboardInterrupt):
+                print("\n  ⚠️  Using default value: 24.0")
+                baseline_end_time = 24.0
+                break
+    
+    # Prompt for baseline method (use command-line arg if provided)
+    if args.baseline_method is not None:
+        baseline_method = args.baseline_method
+        print(f"\nBaseline method: {baseline_method} (from command-line)")
+    else:
+        print("\nBaseline fitting method:")
+        print("  1. constant - Mean of baseline window (default)")
+        print("  2. lowess - Locally Weighted Scatterplot Smoothing")
+        print("  3. polynomial - Polynomial fit")
+        while True:
+            try:
+                method_input = input("Select method [1-3, default: 1]: ").strip()
+                if not method_input:
+                    baseline_method = 'constant'
+                    break
+                elif method_input == '1':
+                    baseline_method = 'constant'
+                    break
+                elif method_input == '2':
+                    baseline_method = 'lowess'
+                    break
+                elif method_input == '3':
+                    baseline_method = 'polynomial'
+                    break
+                else:
+                    print("  ⚠️  Please enter 1, 2, or 3.")
+            except (EOFError, KeyboardInterrupt):
+                print("\n  ⚠️  Using default method: constant")
+                baseline_method = 'constant'
+                break
+    
+    # Prompt for LOWESS frac (if LOWESS selected)
+    if args.baseline_frac is not None:
+        baseline_frac = args.baseline_frac
+        if baseline_method == 'lowess':
+            print(f"LOWESS smoothing fraction: {baseline_frac} (from command-line)")
+    else:
+        baseline_frac = 0.5
+        if baseline_method == 'lowess':
+            while True:
+                try:
+                    frac_input = input("LOWESS smoothing fraction (0.1-1.0) [default: 0.5]: ").strip()
+                    if not frac_input:
+                        baseline_frac = 0.5
+                    else:
+                        baseline_frac = float(frac_input)
+                        if baseline_frac < 0.1 or baseline_frac > 1.0:
+                            print("  ⚠️  Please enter a value between 0.1 and 1.0.")
+                            continue
+                    break
+                except (ValueError, EOFError, KeyboardInterrupt):
+                    print("\n  ⚠️  Using default value: 0.5")
+                    baseline_frac = 0.5
+                    break
+    
+    # Prompt for polynomial order (if polynomial selected)
+    if args.baseline_poly_order is not None:
+        baseline_poly_order = args.baseline_poly_order
+        if baseline_method == 'polynomial':
+            print(f"Polynomial order: {baseline_poly_order} (from command-line)")
+    else:
+        baseline_poly_order = 1
+        if baseline_method == 'polynomial':
+            while True:
+                try:
+                    order_input = input("Polynomial order (1-5) [default: 1]: ").strip()
+                    if not order_input:
+                        baseline_poly_order = 1
+                    else:
+                        baseline_poly_order = int(order_input)
+                        if baseline_poly_order < 1 or baseline_poly_order > 5:
+                            print("  ⚠️  Please enter a value between 1 and 5.")
+                            continue
+                    break
+                except (ValueError, EOFError, KeyboardInterrupt):
+                    print("\n  ⚠️  Using default value: 1")
+                    baseline_poly_order = 1
+                    break
+    
+    # Prompt for normalization mode (use command-line arg if provided)
+    if args.normalization_mode is not None:
+        normalization_mode = args.normalization_mode
+        print(f"\nNormalization mode: {normalization_mode} (from command-line)")
+    else:
+        print("\nNormalization mode:")
+        print("  1. multiplicative - F(t) / g(t) (default)")
+        print("  2. delta_f_over_f - (F(t) - g(t)) / g(t)")
+        while True:
+            try:
+                norm_input = input("Select mode [1-2, default: 1]: ").strip()
+                if not norm_input:
+                    normalization_mode = 'multiplicative'
+                    break
+                elif norm_input == '1':
+                    normalization_mode = 'multiplicative'
+                    break
+                elif norm_input == '2':
+                    normalization_mode = 'delta_f_over_f'
+                    break
+                else:
+                    print("  ⚠️  Please enter 1 or 2.")
+            except (EOFError, KeyboardInterrupt):
+                print("\n  ⚠️  Using default mode: multiplicative")
+                normalization_mode = 'multiplicative'
+                break
+    
+    # Only print summary if we prompted (not if all settings came from command-line)
+    if not all([args.baseline_end_time is not None, args.baseline_method is not None, 
+                args.normalization_mode is not None]):
+        print("\n" + "=" * 70)
+        print("SELECTED SETTINGS:")
+        print(f"  Baseline window end time: {baseline_end_time} s")
+        print(f"  Baseline method: {baseline_method}")
+        if baseline_method == 'lowess':
+            print(f"  LOWESS smoothing fraction: {baseline_frac}")
+        elif baseline_method == 'polynomial':
+            print(f"  Polynomial order: {baseline_poly_order}")
+        print(f"  Normalization mode: {normalization_mode}")
+        print("=" * 70 + "\n")
+    
+    return baseline_end_time, baseline_method, baseline_frac, baseline_poly_order, normalization_mode
+
+
 def main():
     # Use the directory where this script lives as the working directory
     script_dir = os.path.dirname(os.path.abspath(__file__))
     os.chdir(script_dir)
+    
+    # Prompt for baseline and normalization settings
+    baseline_end_time, baseline_method, baseline_frac, baseline_poly_order, normalization_mode = prompt_baseline_settings()
 
     # Find Excel files in this directory
     excel_files = [
@@ -5442,7 +5852,17 @@ def main():
             pass
         else:
             all_plates[plate_id] = long_df
-            write_csvs_for_plate(long_df, csv_root, config, fname)
+            write_csvs_for_plate(
+                long_df, 
+                csv_root, 
+                config, 
+                fname,
+                baseline_end_time=baseline_end_time,
+                baseline_method=baseline_method,
+                baseline_frac=baseline_frac,
+                baseline_poly_order=baseline_poly_order,
+                normalization_mode=normalization_mode
+            )
 
     # Check for duplicates and warn
     duplicates_found = False
