@@ -955,6 +955,25 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       font-size: 0.9rem;
       margin-bottom: 16px;
     }
+    .dataset-line-item {
+      padding: 8px 12px;
+      cursor: pointer;
+      border-bottom: 1px solid #eee;
+      font-size: 0.9rem;
+      transition: background-color 0.15s ease;
+      user-select: none;
+    }
+    .dataset-line-item:hover {
+      background-color: #f0f0f0;
+    }
+    .dataset-line-item.selected {
+      background-color: #e4f0ff;
+      border-left: 3px solid #2a6cff;
+      font-weight: 500;
+    }
+    .dataset-line-item:last-child {
+      border-bottom: none;
+    }
     #well-info {
       margin-top: 8px;
       font-size: 0.9rem;
@@ -1108,8 +1127,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   <div id="content-wrapper">
   <aside>
     <h1>Plate Viewer</h1>
-    <label>Select Dataset Group:</label>
-    <select id="dataset-select"></select>
+    <label>Select Dataset Groups:</label>
+    <div id="dataset-select" style="max-height: 200px; min-height: 60px; overflow-y: auto; border: 1px solid #ddd; border-radius: 4px; background: white; margin-bottom: 16px;">
+      <div style="padding: 12px; color: #666; font-size: 0.85rem; text-align: center;">Loading datasets...</div>
+    </div>
     <div id="dataset-info" style="margin-top: 16px; padding: 12px; background: white; border-radius: 4px; border: 1px solid #ddd; font-size: 0.85rem;">
       <div style="font-weight: 600; margin-bottom: 8px;">Dataset Information</div>
       <div id="dataset-details">Select a dataset to view details.</div>
@@ -1438,7 +1459,8 @@ let viewerData = null;
 let chart = null;
 let selectedWells = new Set(); // Set of {plateId:wellId} strings
 let allWellsData = {}; // Combined wells from all plates: {plateId: {wellId: {...}}}
-let selectedDatasetId = null; // Currently selected dataset ID
+let selectedDatasetIds = new Set(); // Set of selected dataset group IDs (e.g., "group:GROUP_NAME")
+let lastSelectedIndex = -1; // Track last selected index for shift-click
 let enabledDatasets = new Set(); // Set of enabled dataset IDs (empty = all enabled)
 let enabledWells = new Set(); // Set of enabled well IDs (empty = all enabled)
 let enabledColumns = new Set(); // Set of enabled column numbers (empty = all enabled)
@@ -1600,8 +1622,13 @@ function combineAllWells() {
 }
 
 function initDatasetSelect() {
-  const select = document.getElementById("dataset-select");
-  select.innerHTML = "";
+  const container = document.getElementById("dataset-select");
+  container.innerHTML = "";
+  
+  if (!viewerData || !viewerData.plates || viewerData.plates.length === 0) {
+    container.innerHTML = "<div style='padding: 12px; color: #666; font-size: 0.85rem; text-align: center;'>No datasets available.</div>";
+    return;
+  }
   
   // Group plates by column_group
   const platesByGroup = {};
@@ -1616,13 +1643,10 @@ function initDatasetSelect() {
   // Sort groups alphabetically
   const sortedGroups = Object.keys(platesByGroup).sort();
   
-  // Create options for each group (the group itself is selectable)
-  sortedGroups.forEach(groupName => {
+  // Create line items for each group
+  sortedGroups.forEach((groupName, index) => {
     const plates = platesByGroup[groupName];
-    
-    const option = document.createElement("option");
-    // Use special prefix to identify group selections
-    option.value = `group:${groupName}`;
+    const groupId = `group:${groupName}`;
     
     // Create friendly name from first plate's column info
     const firstPlate = plates[0];
@@ -1632,65 +1656,126 @@ function initDatasetSelect() {
     if (columnInfo.genotype) parts.push(columnInfo.genotype);
     if (columnInfo.buffer) parts.push(columnInfo.buffer);
     
-    // Add count if multiple datasets
+    // Create display text
+    let displayText;
     if (plates.length > 1) {
-      option.textContent = parts.length > 0 
+      displayText = parts.length > 0 
         ? `${parts.join(" - ")} (${plates.length} datasets)`
         : `${groupName} (${plates.length} datasets)`;
     } else {
-      option.textContent = parts.length > 0 
+      displayText = parts.length > 0 
         ? parts.join(" - ")
         : groupName;
     }
     
-    select.appendChild(option);
+    // Create line item div
+    const lineItem = document.createElement("div");
+    lineItem.className = "dataset-line-item";
+    lineItem.dataset.groupId = groupId;
+    lineItem.dataset.index = index;
+    lineItem.textContent = displayText;
+    
+    // Add click handler
+    lineItem.addEventListener("click", (e) => {
+      handleDatasetItemClick(e, groupId, index);
+    });
+    
+    container.appendChild(lineItem);
   });
   
   // Select first group by default
   if (sortedGroups.length > 0) {
-    selectedDatasetId = `group:${sortedGroups[0]}`;
-    select.value = selectedDatasetId;
+    const firstGroupId = `group:${sortedGroups[0]}`;
+    selectedDatasetIds.add(firstGroupId);
+    lastSelectedIndex = 0;
+    updateDatasetSelectDisplay();
   }
-  
-  select.addEventListener("change", () => {
-    selectedDatasetId = select.value;
-    // Clean up selected wells - only keep wells from selected datasets
-    const selectedDatasets = getSelectedDatasets();
-    const newSelectedWells = new Set();
-    selectedWells.forEach(key => {
-      const [plateId] = key.split(":");
-      if (selectedDatasets.includes(plateId)) {
-        newSelectedWells.add(key);
-      }
-    });
-    selectedWells = newSelectedWells;
-    // Reset enabled datasets/wells/columns when changing dataset group
-    enabledDatasets.clear();
-    enabledWells.clear();
-    enabledColumns.clear();
-    
-    renderPlateGrid();
-    updateWellInfo();
-    updateDatasetInfo();
-    renderWellSelectorGrid();
-  });
   
   // Update info on initial load
   updateDatasetInfo();
 }
 
+function handleDatasetItemClick(e, groupId, index) {
+  const isShiftClick = e.shiftKey;
+  const isCtrlClick = e.ctrlKey || e.metaKey; // Support both Ctrl and Cmd
+  
+  if (isShiftClick && lastSelectedIndex >= 0) {
+    // Shift-click: select range from lastSelectedIndex to current index
+    const container = document.getElementById("dataset-select");
+    const items = Array.from(container.querySelectorAll(".dataset-line-item"));
+    const startIdx = Math.min(lastSelectedIndex, index);
+    const endIdx = Math.max(lastSelectedIndex, index);
+    
+    for (let i = startIdx; i <= endIdx; i++) {
+      if (items[i]) {
+        const itemGroupId = items[i].dataset.groupId;
+        selectedDatasetIds.add(itemGroupId);
+      }
+    }
+  } else if (isCtrlClick) {
+    // Ctrl/Cmd-click: toggle this item
+    if (selectedDatasetIds.has(groupId)) {
+      selectedDatasetIds.delete(groupId);
+    } else {
+      selectedDatasetIds.add(groupId);
+    }
+  } else {
+    // Regular click: clear all and select only this item
+    selectedDatasetIds.clear();
+    selectedDatasetIds.add(groupId);
+  }
+  
+  lastSelectedIndex = index;
+  updateDatasetSelectDisplay();
+  
+  // Clean up selected wells - only keep wells from selected datasets
+  const selectedDatasets = getSelectedDatasets();
+  const newSelectedWells = new Set();
+  selectedWells.forEach(key => {
+    const [plateId] = key.split(":");
+    if (selectedDatasets.includes(plateId)) {
+      newSelectedWells.add(key);
+    }
+  });
+  selectedWells = newSelectedWells;
+  
+  // Reset enabled datasets/wells/columns when changing dataset groups
+  enabledDatasets.clear();
+  enabledWells.clear();
+  enabledColumns.clear();
+  
+  renderPlateGrid();
+  updateWellInfo();
+  updateDatasetInfo();
+  renderWellSelectorGrid();
+}
+
+function updateDatasetSelectDisplay() {
+  const container = document.getElementById("dataset-select");
+  const items = container.querySelectorAll(".dataset-line-item");
+  
+  items.forEach(item => {
+    const groupId = item.dataset.groupId;
+    if (selectedDatasetIds.has(groupId)) {
+      item.classList.add("selected");
+    } else {
+      item.classList.remove("selected");
+    }
+  });
+}
+
 function updateDatasetInfo() {
   const infoDiv = document.getElementById("dataset-details");
-  if (!infoDiv || !selectedDatasetId) {
+  if (!infoDiv || selectedDatasetIds.size === 0) {
     if (infoDiv) {
-      infoDiv.textContent = "Select a dataset to view details.";
+      infoDiv.textContent = "Select dataset groups to view details.";
     }
     return;
   }
   
   const selectedDatasets = getSelectedDatasets();
   if (selectedDatasets.length === 0) {
-    infoDiv.textContent = "No dataset selected.";
+    infoDiv.textContent = "No datasets selected.";
     return;
   }
   
@@ -1721,7 +1806,8 @@ function updateDatasetInfo() {
   }
   
   html += `<div style="margin-top: 8px; padding-top: 8px; border-top: 1px solid #ddd;">`;
-  html += `<div style="margin-bottom: 4px;"><strong>Datasets:</strong> ${allPlates.length}</div>`;
+  html += `<div style="margin-bottom: 4px;"><strong>Selected Groups:</strong> ${selectedDatasetIds.size}</div>`;
+  html += `<div style="margin-bottom: 4px;"><strong>Total Datasets:</strong> ${allPlates.length}</div>`;
   html += `<div style="font-size: 0.8rem; color: #666;">`;
   allPlates.forEach((plate, idx) => {
     html += `${idx + 1}. ${plate.file || plate.id}`;
@@ -1736,25 +1822,31 @@ function updateDatasetInfo() {
 }
 
 function getSelectedDatasets() {
-  // Return all datasets in the selected group, filtered by enabledDatasets
-  if (!selectedDatasetId) {
+  // Return all datasets in the selected groups, filtered by enabledDatasets
+  if (selectedDatasetIds.size === 0) {
     return [];
   }
   
   let datasets = [];
   
-  // Check if it's a group selection (format: "group:GROUP_NAME")
-  if (selectedDatasetId.startsWith("group:")) {
-    const groupName = selectedDatasetId.substring(6); // Remove "group:" prefix
-    const selectedPlates = viewerData.plates.filter(p => p.column_group === groupName);
-    datasets = selectedPlates.map(p => p.id);
-  } else {
-    // Otherwise, it's a single dataset selection (legacy support)
-    const plate = viewerData.plates.find(p => p.id === selectedDatasetId);
-    if (plate) {
-      datasets = [selectedDatasetId];
+  // Process all selected groups
+  selectedDatasetIds.forEach(groupId => {
+    // Check if it's a group selection (format: "group:GROUP_NAME")
+    if (groupId.startsWith("group:")) {
+      const groupName = groupId.substring(6); // Remove "group:" prefix
+      const selectedPlates = viewerData.plates.filter(p => p.column_group === groupName);
+      datasets.push(...selectedPlates.map(p => p.id));
+    } else {
+      // Otherwise, it's a single dataset selection (legacy support)
+      const plate = viewerData.plates.find(p => p.id === groupId);
+      if (plate) {
+        datasets.push(groupId);
+      }
     }
-  }
+  });
+  
+  // Remove duplicates
+  datasets = [...new Set(datasets)];
   
   // Filter by enabledDatasets if any are set
   if (enabledDatasets.size > 0) {
@@ -1962,7 +2054,7 @@ function updateMonoExponentialInfoPanel(monoExpParams) {
 
 function renderWellSelectorGrid() {
   const grid = document.getElementById("well-selector-grid");
-  if (!grid || !selectedDatasetId) {
+  if (!grid || selectedDatasetIds.size === 0) {
     return;
   }
   
@@ -2118,19 +2210,28 @@ function toggleWellExclusion(wellId) {
 }
 
 function getAllDatasetsInGroup() {
-  // Get all datasets in the selected group (before filtering by enabledDatasets)
-  if (!selectedDatasetId) {
+  // Get all datasets in the selected groups (before filtering by enabledDatasets)
+  if (selectedDatasetIds.size === 0) {
     return [];
   }
   
-  if (selectedDatasetId.startsWith("group:")) {
-    const groupName = selectedDatasetId.substring(6);
-    const selectedPlates = viewerData.plates.filter(p => p.column_group === groupName);
-    return selectedPlates.map(p => p.id);
-  } else {
-    const plate = viewerData.plates.find(p => p.id === selectedDatasetId);
-    return plate ? [selectedDatasetId] : [];
-  }
+  let datasets = [];
+  
+  selectedDatasetIds.forEach(groupId => {
+    if (groupId.startsWith("group:")) {
+      const groupName = groupId.substring(6);
+      const selectedPlates = viewerData.plates.filter(p => p.column_group === groupName);
+      datasets.push(...selectedPlates.map(p => p.id));
+    } else {
+      const plate = viewerData.plates.find(p => p.id === groupId);
+      if (plate) {
+        datasets.push(groupId);
+      }
+    }
+  });
+  
+  // Remove duplicates
+  return [...new Set(datasets)];
 }
 
 function initializeTriplicateGroupColors() {
@@ -2596,7 +2697,7 @@ function updateColumnLegend(columnInfoMap, allDatasets) {
 
 function toggleWellSelection(wellId, plateIds) {
   // Toggle selection for all selected datasets
-  if (!selectedDatasetId) return;
+  if (selectedDatasetIds.size === 0) return;
   
   const selectedDatasets = getSelectedDatasets();
   const column = getColumnFromWellId(wellId);
