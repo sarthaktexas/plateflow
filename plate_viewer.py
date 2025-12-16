@@ -1131,10 +1131,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <div id="dataset-select" style="max-height: 200px; min-height: 60px; overflow-y: auto; border: 1px solid #ddd; border-radius: 4px; background: white; margin-bottom: 16px;">
       <div style="padding: 12px; color: #666; font-size: 0.85rem; text-align: center;">Loading datasets...</div>
     </div>
-    <div id="dataset-info" style="margin-top: 16px; padding: 12px; background: white; border-radius: 4px; border: 1px solid #ddd; font-size: 0.85rem;">
-      <div style="font-weight: 600; margin-bottom: 8px;">Dataset Information</div>
-      <div id="dataset-details">Select a dataset to view details.</div>
-    </div>
     <div id="column-legend" style="margin-top: 16px; padding: 12px; background: white; border-radius: 4px; border: 1px solid #ddd; font-size: 0.85rem;">
       <div style="font-weight: 600; margin-bottom: 8px;">Select Datasets by Column</div>
       <div id="column-legend-content" style="font-size: 0.8rem; color: #666;">No column information available.</div>
@@ -1691,8 +1687,6 @@ function initDatasetSelect() {
     updateDatasetSelectDisplay();
   }
   
-  // Update info on initial load
-  updateDatasetInfo();
 }
 
 function handleDatasetItemClick(e, groupId, index) {
@@ -1746,7 +1740,6 @@ function handleDatasetItemClick(e, groupId, index) {
   
   renderPlateGrid();
   updateWellInfo();
-  updateDatasetInfo();
   renderWellSelectorGrid();
 }
 
@@ -1762,63 +1755,6 @@ function updateDatasetSelectDisplay() {
       item.classList.remove("selected");
     }
   });
-}
-
-function updateDatasetInfo() {
-  const infoDiv = document.getElementById("dataset-details");
-  if (!infoDiv || selectedDatasetIds.size === 0) {
-    if (infoDiv) {
-      infoDiv.textContent = "Select dataset groups to view details.";
-    }
-    return;
-  }
-  
-  const selectedDatasets = getSelectedDatasets();
-  if (selectedDatasets.length === 0) {
-    infoDiv.textContent = "No datasets selected.";
-    return;
-  }
-  
-  // Get metadata from first dataset
-  const firstPlate = viewerData.plates.find(p => p.id === selectedDatasets[0]);
-  if (!firstPlate) {
-    infoDiv.textContent = "Dataset information not available.";
-    return;
-  }
-  
-  const columnInfo = firstPlate.column_info || {};
-  const allPlates = viewerData.plates.filter(p => selectedDatasets.includes(p.id));
-  
-  // Build info HTML
-  let html = "";
-  
-  if (columnInfo.protein) {
-    html += `<div style="margin-bottom: 4px;"><strong>Protein:</strong> ${columnInfo.protein}</div>`;
-  }
-  if (columnInfo.genotype) {
-    html += `<div style="margin-bottom: 4px;"><strong>Genotype:</strong> ${columnInfo.genotype}</div>`;
-  }
-  if (columnInfo.buffer) {
-    html += `<div style="margin-bottom: 4px;"><strong>Buffer:</strong> ${columnInfo.buffer}</div>`;
-  }
-  if (columnInfo.scientist) {
-    html += `<div style="margin-bottom: 4px;"><strong>Scientist:</strong> ${columnInfo.scientist}</div>`;
-  }
-  
-  html += `<div style="margin-top: 8px; padding-top: 8px; border-top: 1px solid #ddd;">`;
-  html += `<div style="margin-bottom: 4px;"><strong>Selected Groups:</strong> ${selectedDatasetIds.size}</div>`;
-  html += `<div style="margin-bottom: 4px;"><strong>Total Datasets:</strong> ${allPlates.length}</div>`;
-  html += `<div style="font-size: 0.8rem; color: #666;">`;
-  allPlates.forEach((plate, idx) => {
-    html += `${idx + 1}. ${plate.file || plate.id}`;
-    if (plate.column_info && plate.column_info.number) {
-      html += ` (${plate.column_info.number})`;
-    }
-    html += "<br>";
-  });
-  html += `</div></div>`;
-  
-  infoDiv.innerHTML = html;
 }
 
 function getSelectedDatasets() {
