@@ -32,25 +32,6 @@ DEFAULT_WELL_LABELS = {
     "O13": "500-5-2"
 }
 
-DEFAULT_TRIPLICATE_GROUPS = [
-    {
-        "name": "250-10-2",
-        "wells": ["B", "C", "D"]
-    },
-    {
-        "name": "500-10-2",
-        "wells": ["E", "F", "G"]
-    },
-    {
-        "name": "250-5-2",
-        "wells": ["H", "I", "J"]
-    },
-    {
-        "name": "500-5-2",
-        "wells": ["K", "L", "M"]
-    }
-]
-
 # Color palette for triplicate groups - matches web interface
 # Each group gets a distinct color (using border color for plots)
 TRIPLICATE_COLORS = [
@@ -402,28 +383,73 @@ def write_csvs_for_plate(
         except Exception:
             pass
     
-    # Get triplicate groups from config
-    triplicate_groups = config.get("triplicate_groups", DEFAULT_TRIPLICATE_GROUPS)
+    # Get well_labels and control_rows from config
+    config_well_labels = config.get("well_labels", {})
+    well_labels = {}
+    
+    # Process config labels - convert well-specific to row-based if needed
+    for key, value in config_well_labels.items():
+        if len(key) > 1 and key[0].isalpha() and key[1:].isdigit():
+            # Old format: "B13" -> extract row "B"
+            row_letter = key[0]
+            if row_letter not in well_labels:
+                well_labels[row_letter] = value
+            elif not well_labels[row_letter] or not well_labels[row_letter].strip():
+                well_labels[row_letter] = value
+        else:
+            # New format: "B" -> use as is
+            well_labels[key] = value
+    
+    # Also convert DEFAULT_WELL_LABELS to row-based format
+    default_row_labels = {}
+    for key, value in DEFAULT_WELL_LABELS.items():
+        if len(key) > 1 and key[0].isalpha():
+            row_letter = key[0]
+            if row_letter not in default_row_labels:
+                default_row_labels[row_letter] = value
+    
+    # Merge defaults with config (config takes precedence)
+    well_labels = {**default_row_labels, **well_labels}
+    
     control_rows = config.get("control_rows", ["N", "O"])
     
-    # Build mapping: well_id -> triplicate group name
+    # Auto-generate groups from well_labels
+    groups = []
+    label_to_rows: Dict[str, List[str]] = {}
+    
+    # Group row letters by their labels
+    for row_letter, label in well_labels.items():
+        # Filter out control wells
+        if not is_control_well(row_letter, control_rows):
+            if label and str(label).strip():
+                if label not in label_to_rows:
+                    label_to_rows[label] = []
+                if row_letter not in label_to_rows[label]:
+                    label_to_rows[label].append(row_letter)
+    
+    # Create groups from labels
+    for label, row_letters in label_to_rows.items():
+        if len(row_letters) >= 1:  # At least 1 row with this label
+            groups.append({
+                "name": label,
+                "wells": sorted(row_letters)  # Store row letters only
+            })
+    
+    # Build mapping: well_id -> group name
     # Use normalized well IDs for consistent matching
     well_to_group = {}
-    for group in triplicate_groups:
+    for group in groups:
         group_name = group.get("name", "")
         group_wells = group.get("wells", [])
-        for well_pattern in group_wells:
-            # Extract row letter from well pattern (e.g., "B" from "B" or "B13")
-            row_letter = well_pattern[0] if well_pattern and well_pattern[0].isalpha() else ""
-            if row_letter:
-                # Find all wells in this row across all columns
-                # Use well_normalized column for consistent matching
-                for normalized_well_id in norm_df["well_normalized"].unique():
-                    if normalized_well_id:
-                        # Check if normalized well ID starts with the row letter
-                        if normalized_well_id and normalized_well_id[0] == row_letter:
-                            # Store mapping using normalized well ID (consistent format)
-                            well_to_group[normalized_well_id] = group_name
+        for row_letter in group_wells:
+            # Find all wells in this row across all columns
+            # Use well_normalized column for consistent matching
+            for normalized_well_id in norm_df["well_normalized"].unique():
+                if normalized_well_id:
+                    # Check if normalized well ID starts with the row letter
+                    if normalized_well_id and normalized_well_id[0] == row_letter:
+                        # Store mapping using normalized well ID (consistent format)
+                        well_to_group[normalized_well_id] = group_name
     
     # Per-well CSVs (normalized values with baseline, without SEM - SEM only belongs in triplicate CSVs)
     plate_folder = os.path.join(csv_root, plate_id)
@@ -458,8 +484,8 @@ def write_csvs_for_plate(
         genotype = column_info.get("genotype", "")
         buffer = column_info.get("buffer", "")
         
-        # Group by triplicate group name and column
-        for group in triplicate_groups:
+        # Group by group name and column
+        for group in groups:
             group_name = group.get("name", "")
             if not group_name:
                 continue
@@ -559,7 +585,6 @@ def write_default_config(config_path: str):
     
     default_config = {
         "well_labels": well_labels,
-        "triplicate_groups": DEFAULT_TRIPLICATE_GROUPS,
         "control_rows": ["N", "O"],
         "bad_wells": []
     }
@@ -655,7 +680,7 @@ def build_viewer_json(all_plates: Dict[str, pd.DataFrame], json_path: str, confi
     {
       "config": {
         "well_labels": {...},
-        "triplicate_groups": [...],  # row-letter groups (applies to all columns)
+        "groups": [...],  # row-letter groups (applies to all columns, auto-generated from well_labels)
         "column_groups": {...}  # mapping of column_group to list of plate_ids
       },
       "plates": [
@@ -741,107 +766,37 @@ def build_viewer_json(all_plates: Dict[str, pd.DataFrame], json_path: str, confi
         if plate_id not in column_groups[column_group]:
             column_groups[column_group].append(plate_id)
     
-    # Process triplicate groups - row letters only, applies to all columns
-    # Config format: {"name": "...", "wells": ["B", "C", "D"]}
-    # Column field is ignored if present (for backward compatibility)
-    config_triplicate_groups = config.get("triplicate_groups", [])
+    # Auto-generate groups from well_labels
+    # Groups wells with the same label together
+    # Exclude control wells from groups
+    groups = []
+    label_to_rows: Dict[str, List[str]] = {}
     
-    if config_triplicate_groups and len(config_triplicate_groups) > 0:
-        # Process triplicate groups - accept row letters only (e.g., ["B", "C", "D"])
-        # Also support backward compatibility with full well IDs (e.g., ["B13", "C13", "D13"])
-        triplicate_groups = []
-        for group in config_triplicate_groups:
-            wells = group.get("wells", [])
-            # Extract row letters from wells (handle both formats)
-            row_letters = []
-            for w in wells:
-                # If it's a full well ID (e.g., "B13"), extract row letter
-                if len(w) > 1 and w[0].isalpha() and w[1:].isdigit():
-                    row_letter = w[0]
-                # If it's just a row letter (e.g., "B"), use as is
-                elif len(w) == 1 and w.isalpha():
-                    row_letter = w
-                else:
-                    continue  # Skip invalid entries
-                
-                # Filter out control wells
-                if not is_control_well(row_letter, control_rows):
-                    if row_letter not in row_letters:
-                        row_letters.append(row_letter)
-            
-            if row_letters:
-                # Store row letters only - applies to all columns
-                triplicate_groups.append({
-                    "name": group.get("name", ""),
-                    "wells": sorted(row_letters)  # Store just row letters
-                })
-        
-        if triplicate_groups:
-            print(f"  Using {len(triplicate_groups)} triplicate group(s) from config (row letters only, applies to all columns)", flush=True)
+    # Group row letters by their labels
+    for row_letter, label in well_labels.items():
+        # Filter out control wells
+        if not is_control_well(row_letter, control_rows):
+            if label and str(label).strip():
+                if label not in label_to_rows:
+                    label_to_rows[label] = []
+                if row_letter not in label_to_rows[label]:
+                    label_to_rows[label].append(row_letter)
+    
+    # Create groups from labels
+    for label, row_letters in label_to_rows.items():
+        if len(row_letters) >= 1:  # At least 1 row with this label
+            groups.append({
+                "name": label,
+                "wells": sorted(row_letters)  # Store row letters only
+            })
+    
+    # Sort groups by name
+    groups.sort(key=lambda x: x.get("name", ""))
+    
+    if groups:
+        print(f"  Auto-generated {len(groups)} group(s) from well_labels (applies to all columns)", flush=True)
     else:
-        # Auto-generate or use defaults
-        # Collect all wells from all plates to auto-generate triplicate groups
-        content_to_wells: Dict[str, List[str]] = {}
-        
-        for plate_id, df in all_plates.items():
-            for well_id, g in df.groupby("well"):
-                g_sorted = g.sort_values("time_s")
-                content = g_sorted["content"].iloc[0]
-                if content and str(content).strip():
-                    if content not in content_to_wells:
-                        content_to_wells[content] = []
-                    if well_id not in content_to_wells[content]:
-                        content_to_wells[content].append(well_id)
-        
-        # Auto-generate triplicate groups: group wells with the same content
-        # Extract row pattern (e.g., BCD, EFG) and apply to all columns
-        # Exclude control wells from triplicate groups
-        auto_triplicate_groups = []
-        for content, wells in content_to_wells.items():
-            # Filter out control wells
-            non_control_wells = [w for w in wells if not is_control_well(w, control_rows)]
-            if len(non_control_wells) >= 2:  # At least 2 non-control wells with same content
-                # Extract row letters (e.g., ["B13", "C13", "D13"] -> ["B", "C", "D"])
-                row_letters = sorted(set([w[0] for w in non_control_wells if w and w[0].isalpha()]))
-                
-                # If we have a pattern of 3 consecutive rows, create a triplicate group
-                # Check for patterns like BCD, EFG, HIJ, etc.
-                if len(row_letters) >= 3:
-                    # Sort row letters and check if they form a consecutive pattern
-                    row_letters_sorted = sorted(row_letters)
-                    # Create group with row pattern (applies to all columns)
-                    auto_triplicate_groups.append({
-                        "name": content,
-                        "wells": row_letters_sorted[:3]  # Store row letters only
-                    })
-                elif len(row_letters) >= 2:
-                    # For 2 wells, still create a group
-                    auto_triplicate_groups.append({
-                        "name": content,
-                        "wells": sorted(row_letters)[:2]  # Store row letters only
-                    })
-        
-        # Sort triplicate groups by name
-        auto_triplicate_groups.sort(key=lambda x: x.get("name", ""))
-        
-        if auto_triplicate_groups:
-            triplicate_groups = auto_triplicate_groups
-            print(f"  Auto-generated {len(triplicate_groups)} triplicate group(s) from data (applies to all columns)", flush=True)
-        else:
-            # Fall back to defaults - already in row letter format
-            # Exclude control wells from default groups
-            triplicate_groups = []
-            for group in DEFAULT_TRIPLICATE_GROUPS:
-                wells = group.get("wells", [])
-                # Filter out control wells
-                row_letters = [w for w in wells if not is_control_well(w, control_rows)]
-                if row_letters:
-                    triplicate_groups.append({
-                        "name": group.get("name", ""),
-                        "wells": sorted(row_letters)  # Already row letters
-                    })
-            if triplicate_groups:
-                print(f"  Using {len(triplicate_groups)} default triplicate group(s) (applies to all columns, control wells excluded)", flush=True)
+        print(f"  No groups generated from well_labels", flush=True)
     
     # Detect duplicate well IDs (same well ID appears in multiple files)
     # This means duplicate columns in the plate grid
@@ -892,7 +847,7 @@ def build_viewer_json(all_plates: Dict[str, pd.DataFrame], json_path: str, confi
     data = {
         "config": {
             "well_labels": well_labels,
-            "triplicate_groups": triplicate_groups,
+            "groups": groups,
             "column_groups": column_groups,
             "control_rows": control_rows,
             "warnings": {
@@ -2179,12 +2134,12 @@ function getAllDatasetsInGroup() {
 
 function initializeTriplicateGroupColors() {
   // Initialize color map if needed (don't reset - keep consistent colors)
-  // This ensures all wells with the same triplicate group name get the same color
+  // This ensures all wells with the same group name get the same color
   // For example, all wells in rows B, C, D with group name "250-10-2" get the same color
   if (Object.keys(triplicateGroupColorMap).length === 0 && viewerData && viewerData.config) {
-    const triplicateGroups = viewerData.config.triplicate_groups || [];
+    const groups = viewerData.config.groups || [];
     let colorIndex = 0;
-    triplicateGroups.forEach(group => {
+    groups.forEach(group => {
       const name = String(group.name || "").trim();
       if (name && !triplicateGroupColorMap[name]) {
         triplicateGroupColorMap[name] = TRIPLICATE_COLORS[colorIndex %% TRIPLICATE_COLORS.length];
@@ -2199,7 +2154,7 @@ function renderPlateGrid() {
   grid.innerHTML = "";
   
   // Initialize color map if needed (don't reset - keep consistent colors)
-  // This ensures all wells with the same triplicate group name get the same color
+  // This ensures all wells with the same group name get the same color
   if (Object.keys(triplicateGroupColorMap).length === 0) {
     initializeTriplicateGroupColors();
   }
@@ -2891,17 +2846,17 @@ function getRowLetter(wellId) {
 }
 
 function getTriplicateGroup(wellId, column) {
-  // Control wells should never be part of triplicate groups
+  // Control wells should never be part of groups
   if (isControlWell(wellId)) {
     return null;
   }
   
   const config = viewerData.config || {};
-  const triplicateGroups = config.triplicate_groups || [];
+  const groups = config.groups || [];
   const rowLetter = getRowLetter(wellId);
   
   // Find group that matches the row pattern (BCD, EFG, etc.) - applies to all columns
-  return triplicateGroups.find(group => {
+  return groups.find(group => {
     if (!group.wells || group.wells.length === 0) {
       return false;
     }
@@ -5149,15 +5104,15 @@ def get_triplicate_group_color(
     config: Dict[str, Any] = None
 ) -> str:
     """
-    Get the color for a triplicate group name.
+    Get the color for a group name.
     Matches the color assignment from the web interface.
     
     Parameters:
     -----------
     group_name : str
-        Name of the triplicate group
+        Name of the group
     config : Dict[str, Any], optional
-        Configuration dictionary with 'triplicate_groups' key
+        Configuration dictionary with 'groups' key (auto-generated from well_labels)
     
     Returns:
     --------
@@ -5169,11 +5124,12 @@ def get_triplicate_group_color(
         config_path = os.path.join(script_dir, "plate_config.json")
         config = load_config(config_path)
     
-    triplicate_groups = config.get("triplicate_groups", DEFAULT_TRIPLICATE_GROUPS)
+    # Use auto-generated groups from config (generated from well_labels)
+    groups = config.get("groups", [])
     
     # Build color map: group name -> color index
     color_map = {}
-    for idx, group in enumerate(triplicate_groups):
+    for idx, group in enumerate(groups):
         name = group.get("name", "").strip()
         if name and name not in color_map:
             color_map[name] = idx
@@ -5193,15 +5149,16 @@ def build_condition_map(
     """
     Build a mapping from well_id to condition name.
     
-    Uses triplicate group names from config to assign conditions.
-    Wells in the same triplicate group (same row pattern) get the same condition.
+    Uses group names from config to assign conditions.
+    Wells in the same group (same row pattern) get the same condition.
+    Groups are auto-generated from well_labels.
     
     Parameters:
     -----------
     df : pd.DataFrame
         Long-format DataFrame with columns ['plate_id', 'well', 'content', 'time_s', 'value']
     config : Dict[str, Any]
-        Configuration dictionary with 'triplicate_groups' key
+        Configuration dictionary with 'groups' key (auto-generated from well_labels)
     
     Returns:
     --------
@@ -5214,11 +5171,12 @@ def build_condition_map(
         config = load_config(config_path)
     
     condition_map = {}
-    triplicate_groups = config.get("triplicate_groups", DEFAULT_TRIPLICATE_GROUPS)
+    # Use auto-generated groups from config (generated from well_labels)
+    groups = config.get("groups", [])
     
     # Build mapping: row_letter -> condition name
     row_to_condition = {}
-    for group in triplicate_groups:
+    for group in groups:
         group_name = group.get("name", "")
         group_wells = group.get("wells", [])
         for well_pattern in group_wells:
@@ -5311,7 +5269,7 @@ def plot_timecourse(
     save_path : str, optional
         Path to save the figure. If None, displays the plot.
     config : Dict[str, Any], optional
-        Configuration dictionary with 'triplicate_groups' key
+        Configuration dictionary with 'groups' key (auto-generated from well_labels)
     """
     import matplotlib.pyplot as plt
     
