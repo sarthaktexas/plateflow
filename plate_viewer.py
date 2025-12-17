@@ -1500,6 +1500,7 @@ let lastSelectedIndex = -1; // Track last selected index for shift-click
 let enabledDatasets = new Set(); // Set of enabled dataset IDs (empty = all enabled)
 let enabledWells = new Set(); // Set of enabled well IDs (empty = all enabled)
 let enabledColumnsByScientist = {}; // Map: scientist -> Set of enabled column numbers (empty set = all enabled)
+let plateIndicatorCleanup = null; // Store cleanup functions for plate indicator event listeners
 
 // Helper function to get enabled columns for a scientist
 function getEnabledColumnsForScientist(scientist) {
@@ -2541,7 +2542,16 @@ function renderPlateGrid() {
         
         div.addEventListener("click", (e) => {
           e.stopPropagation();
-          toggleWellSelection(wellId, plates);
+          // Get all selected datasets that have data for this well (not just current scientist's grid)
+          // This ensures toggles work across all datasets in the selected group
+          const allSelectedDatasets = getSelectedDatasets();
+          const platesWithWell = allSelectedDatasets.filter(plateId => {
+            const plateWells = allWellsData[plateId] || {};
+            // Check if this plate has data for this well using normalized format
+            return plateWells[normalizedWellId] || 
+                   Object.keys(plateWells).some(key => normalizeWellId(key) === normalizedWellId);
+          });
+          toggleWellSelection(wellId, platesWithWell);
         });
         if (isControl) {
           div.classList.add("control");
@@ -2640,6 +2650,12 @@ function renderPlateGrid() {
 
 function createPlateIndicators(container, plateContainers, scientists) {
   if (plateContainers.length === 0) return;
+  
+  // Remove old event listeners if they exist
+  if (plateIndicatorCleanup) {
+    plateIndicatorCleanup();
+    plateIndicatorCleanup = null;
+  }
   
   // Remove existing indicator if present
   const existingIndicator = document.getElementById("plate-indicators");
@@ -2751,16 +2767,29 @@ function createPlateIndicators(container, plateContainers, scientists) {
     });
   };
   
-  container.addEventListener("scroll", () => {
+  // Create named handler functions so they can be removed later
+  const scrollHandler = () => {
     clearTimeout(scrollTimeout);
     scrollTimeout = setTimeout(updateActiveIndicator, 50);
-  });
+  };
+  
+  const resizeHandler = updateActiveIndicator;
+  
+  // Add event listeners
+  container.addEventListener("scroll", scrollHandler);
+  window.addEventListener("resize", resizeHandler);
+  
+  // Store cleanup function
+  plateIndicatorCleanup = () => {
+    container.removeEventListener("scroll", scrollHandler);
+    window.removeEventListener("resize", resizeHandler);
+    if (scrollTimeout) {
+      clearTimeout(scrollTimeout);
+    }
+  };
   
   // Initial update
   updateActiveIndicator();
-  
-  // Update on resize
-  window.addEventListener("resize", updateActiveIndicator);
 }
 
 function updateColumnLegend(columnInfoMap, allDatasets) {
