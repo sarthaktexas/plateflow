@@ -1,5 +1,5 @@
-# plateflow
-A robust fluorescence plate-reader analysis pipeline for kinetic assays. Includes per-well baseline fitting, normalization, replicate aggregation, mean ± SEM statistics, and kinetic modeling with automated parameter extraction. Designed for multi-plate datasets with noisy baselines and variable well performance. Supports different plate sizes but defaults to 384-well plates.
+# Plate Viewer
+A robust fluorescence plate-reader analysis pipeline for kinetic assays. Includes per-well baseline fitting, baseline subtraction, normalization, replicate aggregation, mean ± SEM statistics, and kinetic modeling with automated parameter extraction. Designed for multi-plate datasets with noisy baselines and variable well performance. Supports different plate sizes but defaults to 384-well plates.
 <img width="1792" height="1032" alt="image" src="https://github.com/user-attachments/assets/884ce123-503a-4c06-bfdc-d758f3550b1f" />
 ## Overview
 
@@ -7,21 +7,24 @@ Plate Viewer processes Excel files containing fluorescence time-course data from
 - **CSV files**: Individual well data and condition-specific aggregated data (mean ± SEM)
 - **Interactive web viewer**: A modern browser-based interface for exploring and analyzing plate data
 
-The tool supports advanced data processing workflows including baseline normalization, triplicate grouping, regression curve fitting, and statistical analysis.
+The tool supports baseline subtraction (no division), baseline normalization, triplicate grouping, regression curve fitting, and statistical analysis. You can copy or download the chart as an image, combine datasets by scientist, and filter by column per scientist.
 
 ## Features
 
 ### Data Processing Workflow
 
-1. **Baseline Normalization** (Step 1)
-   - Fit baseline functions using multiple methods
-   - Normalize data using fitted baselines
-   - Filter data points before first timepoint and after cutoff time
+0. **Baseline Subtraction** (Step 0, optional)
+   - Subtract all points from a reference: **lowest point in baseline range** or **first point after baseline**
+   - Same scale as raw fluorescence (no division). Step 2 (grouping) can be enabled after Step 0 only, or after Step 1, or both.
+
+1. **Normalization** (Step 1, optional)
+   - Fit baseline functions (LOWESS, constant, polynomial) and normalize (e.g. ΔF/F, multiplicative, lowest point, first point, or **none**)
+   - Step 2 (grouping) requires **Step 0 or Step 1** (or both) to be enabled.
 
 2. **Triplicate Grouping** (Step 2)
    - Automatically group wells into triplicate groups
    - Calculate mean and SEM across replicates
-   - Requires Step 1 (normalization) to be enabled
+   - **Requires Step 0 (baseline subtraction) or Step 1 (normalization)** to be enabled
 
 3. **Data Cutoff** (Step 3)
    - Exclude data points before the first real timepoint
@@ -50,7 +53,7 @@ The tool supports advanced data processing workflows including baseline normaliz
   - Parameters: Polynomial order (1 = linear, 2 = quadratic, etc.)
   - Formula: g(t) = c₀ + c₁t + c₂t² + ...
 
-### Normalization Modes
+### Normalization Modes (Step 1)
 
 - **ΔF/F** (Delta F over F)
   - Formula: F'(t) = (F(t) - g(t)) / g(t)
@@ -63,6 +66,14 @@ The tool supports advanced data processing workflows including baseline normaliz
   - Best for: Fold-change analysis
   - Values are always positive (ratio to baseline)
   - Interpretation: 1.0 = no change, 2.0 = 2-fold increase, 0.5 = 2-fold decrease
+
+- **LOWEST POINT IN RANGE** — Normalize by the minimum value in the baseline window: F_norm(t) = F(t) / min(F_baseline).
+
+- **FIRST POINT AFTER BASELINE** — Normalize by the first data point after the baseline window ends (per well).
+
+- **NONE** — No normalization; raw fluorescence values are used. Step 2 (triplicate grouping) still requires Step 0 or Step 1 to be enabled (e.g. enable Step 0 only for baseline-subtracted raw data with grouping).
+
+When **Step 0** (baseline subtraction) and **Step 1** (normalization) are both enabled, the combined pipeline applies (F − ref) / ref (ΔF/F), where ref is from Step 0 (lowest point in baseline range or first point after baseline).
 
 ### Regression Curve Types
 
@@ -184,67 +195,68 @@ If no configuration file exists, the script will auto-generate one with defaults
 
 ### Dataset Selection
 
-- **Select Dataset Group**: Choose a column group (protein_genotype_buffer combination)
-- **Column Legend**: Enable/disable specific columns to filter data
-- **Well Selector**: Click wells on the plate grid to include/exclude them from analysis
+- **Select Dataset Groups**: Choose one or more column groups (protein_genotype_buffer combination).
+  - **Click**: Select a single group (clears previous selection).
+  - **Shift+Click**: Select a range of groups (from last clicked to current).
+  - **Ctrl/Cmd+Click**: Toggle a group on or off without clearing others.
+- **Column Legend**: Per-scientist column filter — enable/disable specific columns for each scientist’s datasets. Checkboxes apply per scientist so you can show only certain columns per plate group.
+- **Well Selector**: Expand “Select Wells” and click wells on the mini grid to **exclude** them from analysis (excluded wells show ✕). Click again to include. Applies across the selected dataset groups.
 
-### Data Processing Options
+### Combining Scientist Well Plates
 
-#### Step 1: Normalize using fitted baseline
+When multiple plates share the same column group but have different scientist initials (from the filename’s 4th part), the viewer:
 
-**Baseline Fitting Method:**
-- **LOWESS**: For non-linear baselines with smooth trends
-  - Smoothing fraction (frac): 0.1-1.0 (default: 0.5)
-    - Higher (0.7-0.9) = smoother, more global fit
-    - Lower (0.2-0.4) = more local, follows data closely
-- **CONSTANT**: For stable/flat baselines
-- **POLYNOMIAL**: For linear or polynomial drift
-  - Polynomial order: 1-5 (default: 1 = linear)
+- **Groups plates by scientist**: Plates are grouped by scientist initials; each scientist gets a separate plate grid section.
+- **Horizontal scrolling**: Grids are laid out side-by-side with scroll-snap; use the horizontal scroll or the **plate indicators** (dots below the grids) to jump to a scientist’s section.
+- **Plate indicators**: Dots below the plate grids show which scientist section is in view; click a dot to scroll to that scientist’s grid. Tooltips show scientist name (or “No Scientist”).
+- **Per-scientist column filter**: In the Column Legend, columns are listed with checkboxes per dataset; enabling/disabling is tracked per scientist so you can filter columns independently for each scientist’s plates.
 
-**Baseline Window End Time**: Maximum time (seconds) for baseline window (default: 24.0)
+### Data Processing Options (Workflow)
 
-**Normalization Mode:**
-- **ΔF/F**: Relative change from baseline (can be negative)
-- **MULTIPLICATIVE**: Fold-change (always positive)
+#### Step 0: Baseline subtraction (optional)
 
-#### Step 2: Group wells into triplicate groups
+- **Baseline window end (s)**: End time for the baseline range (default: 24).
+- **Reference**: **Lowest point in baseline range** or **First point after baseline**.
+- Effect: Subtract every point from the chosen reference (same units as raw fluorescence; no division). Step 2 (grouping) can be enabled with Step 0 only, with Step 1 only, or with both. When Step 1 is also enabled, Step 1’s baseline window is used and the pipeline becomes (F − ref) / ref (ΔF/F).
 
-- Groups wells that are part of triplicate groups (from configuration)
-- Calculates mean ± SEM across replicates
-- **Requires Step 1 to be enabled**
+#### Step 1: Normalize using fitted baseline (optional)
 
-#### Step 3: Cutoff data points
+- **Baseline window end (s)**: Maximum time for baseline fitting (default: 24).
+- **Baseline Fitting Method** and **Normalization mode** are set in the expandable **Baseline Fitting & Normalization Options** section (click to expand). Methods: LOWESS, CONSTANT, or POLYNOMIAL. Modes: ΔF/F, MULTIPLICATIVE, Lowest Point in Range, First Point After Baseline, or **None** (no normalization; raw values).
+- Step 2 requires **Step 0 or Step 1** (or both) to be enabled.
 
-- **Cutoff Time**: Maximum time (seconds) to include (default: 360)
-- Excludes data before first real timepoint and after cutoff time
+#### Step 2: Group wells into triplicate groups (optional)
 
-#### Step 4: Fit regression curve to data points
+- Groups wells that belong to triplicate groups (from configuration).
+- Calculates mean ± SEM across replicates.
+- **Requires Step 0 (baseline subtraction) or Step 1 (normalization)** to be enabled.
 
-**Regression Type:**
-- **Linear**: y = a + b·x
-- **Polynomial**: y = c₀ + c₁x + c₂x² + ... (order 2-5)
-- **Exponential**: y = a · e^(b·x)
-- **Logarithmic**: y = a + b·ln(x)
-- **Mono-exponential (rise to plateau)**: y(t) = 1 + A(1 - e^(-k(t-t₀)))
-  - Displays parameters: A (amplitude), k (rate constant), τ (time constant), t₀ (start time), t_half (half-time), plateau
+#### Step 3: Cutoff data points (optional)
 
-**Polynomial Order**: For polynomial regression (2-5, default: 2)
+- **Cutoff time (s)**: Maximum time to include (default: 360).
+- Excludes points before the first real timepoint and after the cutoff time.
+
+#### Step 4: Fit regression curve (optional)
+
+- **Regression type**: Linear, Polynomial, Exponential, Logarithmic, or Mono-exponential (rise to plateau).
+- **Polynomial order**: For polynomial regression (2–5, default: 2).
+- Mono-exponential fits show an **info panel** with A, k, τ, t₀, t₁/₂, plateau. Control wells use linear regression by default.
 
 ### Chart Features
 
-- **Interactive legend**: Click to show/hide datasets
-- **Error bars**: Display SEM for triplicate groups
-- **Tooltips**: Hover over data points to see values
-- **Zoom/Pan**: Use mouse wheel and drag to navigate
-- **Baseline labels**: Display baseline values on chart (when applicable)
+- **Copy as image**: Copies the current chart as a PNG to the clipboard (falls back to download if copy is not supported).
+- **Download as image**: Saves the current chart as a PNG file (`plate-viewer-chart-YYYY-MM-DD-HHMMSS.png`).
+- **Interactive legend**: Click to show/hide datasets.
+- **Error bars**: SEM for triplicate (or n-plicate) groups.
+- **Tooltips**: Hover over points to see values (and ± error when available).
+- **Baseline labels**: Baseline values shown on the chart when applicable.
 
-### Well Information
+### Well Information and Interactions
 
-- Click wells on the plate grid to see:
-  - Well ID
-  - Content/label
-  - Row-based label (from configuration)
-  - Dataset count (if multiple datasets have data for this well)
+- **Plate grid**: Click wells to add/remove them from the chart. Triplicate groups: one click selects/deselects the whole group for that column. Control wells are selected independently.
+- **Duplicate wells**: If the same well (same scientist + well ID) appears in multiple files, the well is marked and clicking it selects all matching datasets for comparison.
+- **Well info area**: Shows number of selected wells and datasets; prompts to click wells or “Update Chart” as needed.
+- **Well selector**: Expand “Select Wells” to exclude specific wells from analysis via the mini grid (excluded = ✕).
 
 ## Compiling to AppleScript
 
@@ -255,14 +267,17 @@ Please use Automator to create this.
 
 The AppleScript:
 1. Prompts user to select a folder containing `.xlsx` files (or uses folder from Automator/Finder)
-2. Automatically installs required Python packages if needed:
+2. Optionally shows an introductory dialog explaining baseline and normalization settings (Step 0 / Step 1 / Step 2) for CSV generation and the web viewer
+3. Prompts for **normalization / processing mode**: None (raw values), ΔF/F, Multiplicative, Lowest point, First point after baseline, **Baseline subtract: lowest point (Step 0)**, or **Baseline subtract: first point after baseline (Step 0)** — matching the web viewer’s Step 0 and Step 1
+4. Prompts for **baseline fitting method** (when applicable): LOWESS, constant, or polynomial, with clear labels
+5. Automatically installs required Python packages if needed:
    - Tries `pip install --user` first
    - Falls back to `--break-system-packages` for Python 3.11+
    - Tries without flags as last resort
-3. Decodes and executes the embedded Python code
-4. Processes all Excel files in the selected folder
-5. Generates CSV files and web viewer
-6. Shows a completion notification
+6. Decodes and executes the embedded Python code
+7. Processes all Excel files in the selected folder
+8. Generates CSV files and web viewer
+9. Shows a completion notification
 
 **Note**: The Python code is embedded as base64 in the AppleScript. To update it, you would need to:
 1. Encode `plate_viewer.py` to base64
@@ -340,7 +355,13 @@ For each condition and timepoint:
 
 ### Command Line Options
 
-Currently, the script processes all `.xlsx` files in the current directory. No command-line arguments are supported yet.
+When run interactively, `plate_viewer.py` may prompt for:
+
+- **Normalization / processing mode** (for CSV generation): `none` (raw values), `delta_f_over_f`, `multiplicative`, `lowest_point`, `first_point`, `baseline_subtract_lowest` (Step 0: subtract from lowest point in baseline range), or `baseline_subtract_first` (Step 0: subtract from first point after baseline). These align with the web viewer’s Step 0 and Step 1; baseline-subtract modes produce baseline-subtracted CSVs without division; `none` skips normalization so CSVs contain raw fluorescence.
+- **Baseline fitting method** (when a normalization mode that uses a fitted baseline is chosen): LOWESS, constant, or polynomial, with optional parameters (e.g. smoothing fraction, polynomial order).
+- **Baseline window end time**: End time (seconds) for the baseline window used in normalization or Step 0.
+
+The script processes all `.xlsx` files in the current directory. Optional command-line arguments (e.g. `--normalization`, `--baseline-method`) may be available; run `python3 plate_viewer.py --help` to check.
 
 ### Customizing Defaults
 
