@@ -310,6 +310,7 @@ def write_csvs_for_plate(
     csv_root: str, 
     config: Dict[str, Any] = None, 
     filename: str = None,
+    baseline_start_time: float = 0.0,
     baseline_end_time: float = 20.0,
     baseline_method: str = 'constant',
     baseline_frac: float = 0.5,
@@ -331,8 +332,10 @@ def write_csvs_for_plate(
         Configuration dictionary
     filename : str, optional
         Source filename for parsing column info
+    baseline_start_time : float
+        Minimum time (in seconds) for baseline window (default: 0.0)
     baseline_end_time : float
-        Maximum time (in seconds) for baseline window (default: 24.0)
+        Maximum time (in seconds) for baseline window (default: 20.0)
     baseline_method : str
         Baseline fitting method: 'lowess', 'constant', or 'polynomial' (default: 'constant')
     baseline_frac : float
@@ -340,7 +343,7 @@ def write_csvs_for_plate(
     baseline_poly_order : int
         Polynomial order for polynomial fit (default: 1)
     normalization_mode : str
-        Normalization mode: 'delta_f_over_f' or 'multiplicative' (default: 'multiplicative')
+        Mode: 'delta_f_over_f', 'multiplicative', 'lowest_point', 'first_point', 'none', 'baseline_subtract_lowest', or 'baseline_subtract_first' (default: 'multiplicative')
     """
     plate_id = long_df["plate_id"].iloc[0]
     print(f"  Writing CSVs for {plate_id}...", flush=True)
@@ -360,21 +363,50 @@ def write_csvs_for_plate(
         if original_count != filtered_count:
             print(f"    Excluding {original_count - filtered_count} data points from bad wells", flush=True)
     
-    # Normalize data with baseline before writing CSVs
-    print(f"    Normalizing data with baseline (method={baseline_method}, mode={normalization_mode})...", flush=True)
-    baseline_fits = fit_well_baselines(
-        long_df,
-        baseline_end_time=baseline_end_time,
-        method=baseline_method,
-        frac=baseline_frac,
-        poly_order=baseline_poly_order,
-        config=config
-    )
-    norm_df = normalize_wells(long_df, baseline_fits, normalization_mode=normalization_mode)
+    # Normalize, baseline-subtract, or use raw values before writing CSVs
+    if normalization_mode == 'none':
+        print(f"    Skipping normalization (mode: none). Using raw values...", flush=True)
+        norm_df = long_df.copy()
+    elif normalization_mode in ('baseline_subtract_lowest', 'baseline_subtract_first'):
+        print(f"    Baseline subtraction (mode: {normalization_mode})...", flush=True)
+        norm_df = long_df.copy()
+        ref_per_well: Dict[str, float] = {}
+        for well_id, grp in long_df.groupby("well"):
+            grp_sorted = grp.sort_values("time_s")
+            if normalization_mode == 'baseline_subtract_lowest':
+                baseline_vals = grp_sorted.loc[grp_sorted["time_s"] <= baseline_end_time, "value"].dropna()
+                if len(baseline_vals) == 0:
+                    ref_per_well[well_id] = np.nan
+                else:
+                    ref_per_well[well_id] = float(baseline_vals.min())
+            else:
+                after = grp_sorted[grp_sorted["time_s"] > baseline_end_time]
+                if len(after) == 0:
+                    ref_per_well[well_id] = np.nan
+                else:
+                    ref_per_well[well_id] = float(after["value"].iloc[0])
+        norm_df["value"] = norm_df.apply(
+            lambda row: (row["value"] - ref_per_well[row["well"]]) if not np.isnan(ref_per_well.get(row["well"], np.nan)) else row["value"],
+            axis=1
+        )
+        print(f"    ✓ Baseline-subtracted {len(norm_df)} data points", flush=True)
+    else:
+        print(f"    Normalizing data with baseline (method={baseline_method}, mode={normalization_mode})...", flush=True)
+        baseline_windows = identify_baseline_window(long_df, baseline_start_time, baseline_end_time)
+        baseline_fits = fit_well_baselines(
+            long_df,
+            baseline_start_time=baseline_start_time,
+            baseline_end_time=baseline_end_time,
+            method=baseline_method,
+            frac=baseline_frac,
+            poly_order=baseline_poly_order,
+            config=config
+        )
+        norm_df = normalize_wells(long_df, baseline_fits, normalization_mode=normalization_mode, baseline_windows=baseline_windows, baseline_start_time=baseline_start_time, baseline_end_time=baseline_end_time)
+        print(f"    ✓ Normalized {len(norm_df)} data points", flush=True)
     # Add normalized well ID column for consistent matching
     norm_df = norm_df.copy()
     norm_df["well_normalized"] = norm_df["well"].apply(lambda w: normalize_well_id(str(w).strip()))
-    print(f"    ✓ Normalized {len(norm_df)} data points", flush=True)
     
     # Parse column info from filename if provided
     column_info = None
@@ -1190,12 +1222,40 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <div style="margin-top: 16px; padding: 12px; background: white; border-radius: 4px; border: 1px solid #ddd;">
       <div style="font-weight: 600; margin-bottom: 8px; font-size: 0.95rem; color: #333;">Data Processing Workflow</div>
       <div style="font-size: 0.75rem; color: #666; margin-bottom: 12px; padding: 8px; background: #f9f9f9; border-radius: 3px;">
+        <strong>Step 0:</strong> Baseline subtraction (if enabled) — subtract all points from lowest or first-after-baseline<br>
         <strong>Step 1:</strong> Normalize using fitted baseline (if enabled)<br>
-        <strong>Step 2:</strong> Group wells into triplicate groups (if enabled)<br>
+        <strong>Step 2:</strong> Group wells into triplicate groups (if enabled) — requires Step 0 or Step 1<br>
         <strong>Step 3:</strong> Cutoff data points before first timepoint and after time point (if enabled)<br>
         <strong>Step 4:</strong> Fit regression curve to data points (if enabled)
       </div>
       <label style="display: flex; align-items: center; cursor: pointer; font-size: 0.9rem;">
+        <input type="checkbox" id="baseline-subtract-toggle" style="margin-right: 8px; cursor: pointer;" onchange="updateChart();">
+        <span><strong>Step 0:</strong> Baseline subtraction</span>
+      </label>
+      <div style="font-size: 0.75rem; color: #666; margin-top: 4px; margin-bottom: 8px; margin-left: 24px;">
+        Subtract all points from a reference (lowest in baseline range or first point after baseline). Same scale as raw fluorescence; no division.
+      </div>
+      <div id="baseline-subtract-parameters" style="font-size: 0.8rem; padding: 8px; background: #f9f9f9; border-radius: 3px; display: none; margin-left: 24px; margin-bottom: 8px;">
+        <div style="margin-bottom: 8px;">
+          <label style="display: flex; align-items: center; margin-bottom: 4px;">
+            <span style="min-width: 120px;">Baseline window end (s):</span>
+            <input type="number" id="baseline-subtract-end-time" value="24" min="0" step="0.1" style="width: 80px; padding: 4px; border: 1px solid #ddd; border-radius: 3px; font-family: monospace;" onchange="updateChart();">
+          </label>
+        </div>
+        <div style="margin-bottom: 8px;">
+          <label style="display: flex; align-items: center; margin-bottom: 4px;">
+            <span style="min-width: 120px;">Reference:</span>
+            <select id="baseline-subtract-mode" style="flex: 1; max-width: 220px; padding: 4px; border: 1px solid #ddd; border-radius: 3px; font-size: 0.85rem;" onchange="updateChart();">
+              <option value="lowest_point">Lowest point in baseline range</option>
+              <option value="first_point">First point after baseline</option>
+            </select>
+          </label>
+        </div>
+        <div style="font-size: 0.75rem; color: #666; margin-top: 4px;">
+          Subtract each value from the chosen reference. Step 2 (grouping) can be enabled with Step 0 only, or with Step 1, or both. When Step 1 is also enabled, Step 1's baseline window is used.
+        </div>
+      </div>
+      <label style="display: flex; align-items: center; cursor: pointer; font-size: 0.9rem; margin-top: 12px;">
         <input type="checkbox" id="normalize-baseline-toggle" style="margin-right: 8px; cursor: pointer;" onchange="updateChart();">
         <span><strong>Step 1:</strong> Normalize using fitted baseline</span>
       </label>
@@ -1224,7 +1284,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         <span><strong>Step 2:</strong> Group wells into triplicate groups</span>
       </label>
       <div style="font-size: 0.75rem; color: #666; margin-top: 4px; margin-left: 24px;">
-        When enabled, wells that are part of triplicate groups (e.g., rows B, C, D) are grouped together. When disabled, each well is shown individually. <strong>Note:</strong> Requires Step 1 (normalization) to be enabled.
+        When enabled, wells that are part of triplicate groups (e.g., rows B, C, D) are grouped together. When disabled, each well is shown individually. <strong>Note:</strong> Requires Step 0 (baseline subtraction) or Step 1 (normalization) to be enabled.
       </div>
       <label style="display: flex; align-items: center; cursor: pointer; font-size: 0.9rem; margin-top: 12px;">
         <input type="checkbox" id="cutoff-baseline-toggle" style="margin-right: 8px; cursor: pointer;" onchange="updateChart();">
@@ -1326,6 +1386,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
               <select id="normalization-mode-select" style="flex: 1; padding: 4px; border: 1px solid #ddd; border-radius: 3px; font-size: 0.85rem;" onchange="updateCurrentSettingsDisplay();">
                 <option value="delta_f_over_f">ΔF/F (Delta F over F)</option>
                 <option value="multiplicative" selected>Multiplicative</option>
+                <option value="lowest_point">Lowest Point in Range</option>
+                <option value="first_point">First Point After Baseline</option>
+                <option value="none">None (no normalization)</option>
               </select>
             </label>
           </div>
@@ -1443,6 +1506,53 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
               Values are always positive (ratio to baseline)
             </div>
           </div>
+          <div style="margin-bottom: 12px; padding: 8px; background: #f9f9f9; border-radius: 3px;">
+            <div style="font-weight: 600; margin-bottom: 4px;">3. LOWEST POINT IN RANGE</div>
+            <div style="margin-left: 12px; margin-bottom: 4px;">
+              <strong>Formula:</strong> F_norm(t) = F(t) / min(F_baseline_range)
+            </div>
+            <div style="margin-left: 12px; margin-bottom: 4px;">
+              <strong>When to use:</strong> Normalize using the minimum value in the baseline range
+            </div>
+            <div style="margin-left: 12px; margin-bottom: 4px;">
+              <strong>Best for:</strong> When you want to normalize relative to the lowest baseline point
+            </div>
+            <div style="margin-left: 12px; margin-bottom: 4px;">
+              <strong>Interpretation:</strong>
+              <ul style="margin: 4px 0 0 20px; padding-left: 0;">
+                <li>Uses the minimum value from all timepoints in the baseline range (0 to baseline end time)</li>
+                <li>All subsequent values are divided by this minimum baseline value</li>
+                <li>Useful when baseline has some noise and you want to normalize to the lowest point</li>
+              </ul>
+            </div>
+            <div style="margin-left: 12px;">
+              Values are always positive (ratio to minimum baseline)
+            </div>
+          </div>
+          <div style="margin-bottom: 12px; padding: 8px; background: #f9f9f9; border-radius: 3px;">
+            <div style="font-weight: 600; margin-bottom: 4px;">4. FIRST POINT AFTER BASELINE</div>
+            <div style="margin-left: 12px; margin-bottom: 4px;">
+              <strong>Formula:</strong> F_norm(t) = F(t) / F_first_after_baseline
+            </div>
+            <div style="margin-left: 12px; margin-bottom: 4px;">
+              <strong>When to use:</strong> Normalize using the first data point after the baseline range ends
+            </div>
+            <div style="margin-left: 12px; margin-bottom: 4px;">
+              <strong>Best for:</strong> When each run has a different "first point" after baseline and you want to normalize to that point
+            </div>
+            <div style="margin-left: 12px; margin-bottom: 4px;">
+              <strong>Interpretation:</strong>
+              <ul style="margin: 4px 0 0 20px; padding-left: 0;">
+                <li>Finds the first timepoint after the baseline range ends (time > baseline end time)</li>
+                <li>Uses that point's value as the normalization constant for that well/run</li>
+                <li>Each well/run will have its own "first point" after baseline</li>
+                <li>All values for that well are divided by its specific first point after baseline</li>
+              </ul>
+            </div>
+            <div style="margin-left: 12px;">
+              Values are always positive (ratio to first point after baseline)
+            </div>
+          </div>
         </div>
         <div>
           <div style="font-weight: 600; margin-bottom: 8px; color: #2a6cff;">Statistics Computation</div>
@@ -1482,6 +1592,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   <main>
     <div id="plate-grids-container"></div>
     <div id="chart-container">
+      <div id="chart-toolbar" style="display: flex; gap: 8px; margin-bottom: 8px; align-items: center; flex-wrap: wrap;">
+        <button type="button" class="btn" onclick="copyChartAsImage()" title="Copy the current chart to clipboard">Copy as image</button>
+        <button type="button" class="btn" onclick="downloadChartAsImage()" title="Save the current chart as a PNG file">Download as image</button>
+      </div>
       <canvas id="well-chart"></canvas>
     </div>
   </main>
@@ -1964,7 +2078,21 @@ function updateCurrentSettingsDisplay() {
   
   if (normalizationModeEl && normalizationModeSelect) {
     const mode = normalizationModeSelect.value;
-    normalizationModeEl.textContent = mode === "delta_f_over_f" ? "ΔF/F" : "Multiplicative";
+    let displayName;
+    if (mode === "delta_f_over_f") {
+      displayName = "ΔF/F";
+    } else if (mode === "multiplicative") {
+      displayName = "Multiplicative";
+    } else if (mode === "lowest_point") {
+      displayName = "Lowest Point";
+    } else if (mode === "first_point") {
+      displayName = "First Point After";
+    } else if (mode === "none") {
+      displayName = "None";
+    } else {
+      displayName = mode;
+    }
+    normalizationModeEl.textContent = displayName;
   }
   
   if (regressionTypeEl && regressionTypeSelect) {
@@ -3211,6 +3339,79 @@ function clearSelection() {
   updateChart();
 }
 
+function getChartCanvas() {
+  return document.getElementById("well-chart");
+}
+
+function dataURLtoBlob(dataURL) {
+  var parts = dataURL.split(",");
+  var mime = (parts[0].match(/:(.*?);/) || [])[1] || "image/png";
+  var bstr = atob(parts[1]);
+  var n = bstr.length;
+  var u8 = new Uint8Array(n);
+  for (var i = 0; i < n; i++) u8[i] = bstr.charCodeAt(i);
+  return new Blob([u8], { type: mime });
+}
+
+function doDownloadChartAsImage() {
+  var canvas = getChartCanvas();
+  if (!canvas || !chart) return false;
+  var a = document.createElement("a");
+  var now = new Date();
+  var pad = function(n) { return String(n).padStart(2, "0"); };
+  var stamp = now.getFullYear() + "-" + pad(now.getMonth() + 1) + "-" + pad(now.getDate()) + "-" + pad(now.getHours()) + pad(now.getMinutes()) + pad(now.getSeconds());
+  a.download = "plate-viewer-chart-" + stamp + ".png";
+  a.href = canvas.toDataURL("image/png");
+  a.click();
+  return true;
+}
+
+function copyChartAsImage() {
+  var canvas = getChartCanvas();
+  if (!canvas || !chart) return;
+  var blob = dataURLtoBlob(canvas.toDataURL("image/png"));
+  if (navigator.clipboard && navigator.clipboard.write) {
+    navigator.clipboard.write([new ClipboardItem({ "image/png": blob })])
+      .catch(function() { copyChartFallback(blob); });
+    return;
+  }
+  copyChartFallback(blob);
+}
+
+function copyChartFallback(blob) {
+  var file = new File([blob], "chart.png", { type: "image/png" });
+  var onCopy = function(e) {
+    e.preventDefault();
+    e.clipboardData.items.add(file, "image/png");
+    document.removeEventListener("copy", onCopy);
+  };
+  document.addEventListener("copy", onCopy);
+  var sel = window.getSelection();
+  var range = document.createRange();
+  var div = document.createElement("div");
+  div.style.setProperty("position", "absolute");
+  div.style.setProperty("left", "-9999px");
+  div.textContent = " ";
+  document.body.appendChild(div);
+  range.selectNodeContents(div);
+  sel.removeAllRanges();
+  sel.addRange(range);
+  var ok = false;
+  try {
+    ok = document.execCommand("copy");
+  } catch (err) {
+    console.error(err);
+  }
+  document.body.removeChild(div);
+  sel.removeAllRanges();
+  document.removeEventListener("copy", onCopy);
+  if (!ok) doDownloadChartAsImage();
+}
+
+function downloadChartAsImage() {
+  doDownloadChartAsImage();
+}
+
 function updateWellInfo() {
   const el = document.getElementById("well-info");
   if (selectedWells.size === 0) {
@@ -3749,9 +3950,120 @@ function fitBaselineFunction(timePoints, values, method = 'lowess', frac = 0.5, 
   return null;
 }
 
-// Normalize well data using fitted baseline (Step 4)
+// Step 0: Baseline subtraction — subtract all points from ref (lowest or first-after-baseline). No division.
+function baselineSubtractWellData(wellData, baselineEndTime, mode) {
+  if (!wellData || !wellData.time_s || !wellData.values) {
+    return wellData;
+  }
+  const baselineValues = [];
+  for (let i = 0; i < wellData.time_s.length; i++) {
+    const time = wellData.time_s[i];
+    const val = wellData.values[i];
+    if (time !== null && val !== null && time <= baselineEndTime) {
+      baselineValues.push(val);
+    }
+  }
+  if (baselineValues.length === 0) {
+    return wellData;
+  }
+  let ref;
+  if (mode === 'lowest_point') {
+    ref = Math.min(...baselineValues);
+  } else {
+    const afterBaselinePoints = [];
+    for (let i = 0; i < wellData.time_s.length; i++) {
+      const time = wellData.time_s[i];
+      const value = wellData.values[i];
+      if (time !== null && value !== null && time > baselineEndTime) {
+        afterBaselinePoints.push({ time: time, value: value });
+      }
+    }
+    afterBaselinePoints.sort((a, b) => a.time - b.time);
+    if (afterBaselinePoints.length === 0) {
+      return wellData;
+    }
+    ref = afterBaselinePoints[0].value;
+  }
+  if (!isFinite(ref)) {
+    return wellData;
+  }
+  const subtractedTimes = [];
+  const subtractedValues = [];
+  const originalValues = wellData.values.slice ? wellData.values.slice() : [...wellData.values];
+  for (let i = 0; i < wellData.time_s.length; i++) {
+    const time = wellData.time_s[i];
+    const value = wellData.values[i];
+    if (time === null || value === null) continue;
+    subtractedTimes.push(time);
+    subtractedValues.push(value - ref);
+  }
+  if (subtractedTimes.length === 0) return null;
+  return {
+    time_s: subtractedTimes,
+    values: subtractedValues,
+    originalValues: originalValues,
+    label: wellData.label,
+    content: wellData.content
+  };
+}
+
+// Step 0 + Step 1 combined: (F - ref) / ref = ΔF/F, using Step 0 ref (lowest or first-after-baseline).
+function baselineSubtractAndNormalizeWellData(wellData, baselineEndTime, mode) {
+  if (!wellData || !wellData.time_s || !wellData.values) {
+    return wellData;
+  }
+  const baselineValues = [];
+  for (let i = 0; i < wellData.time_s.length; i++) {
+    const time = wellData.time_s[i];
+    const val = wellData.values[i];
+    if (time !== null && val !== null && time <= baselineEndTime) {
+      baselineValues.push(val);
+    }
+  }
+  if (baselineValues.length === 0) return wellData;
+  let ref;
+  if (mode === 'lowest_point') {
+    ref = Math.min(...baselineValues);
+  } else {
+    const afterBaselinePoints = [];
+    for (let i = 0; i < wellData.time_s.length; i++) {
+      const time = wellData.time_s[i];
+      const value = wellData.values[i];
+      if (time !== null && value !== null && time > baselineEndTime) {
+        afterBaselinePoints.push({ time: time, value: value });
+      }
+    }
+    afterBaselinePoints.sort((a, b) => a.time - b.time);
+    if (afterBaselinePoints.length === 0) return wellData;
+    ref = afterBaselinePoints[0].value;
+  }
+  if (!isFinite(ref) || ref === 0) return wellData;
+  const outTimes = [];
+  const outValues = [];
+  const originalValues = wellData.values.slice ? wellData.values.slice() : [...wellData.values];
+  for (let i = 0; i < wellData.time_s.length; i++) {
+    const time = wellData.time_s[i];
+    const value = wellData.values[i];
+    if (time === null || value === null) continue;
+    outTimes.push(time);
+    outValues.push((value - ref) / ref);
+  }
+  if (outTimes.length === 0) return null;
+  return {
+    time_s: outTimes,
+    values: outValues,
+    originalValues: originalValues,
+    label: wellData.label,
+    content: wellData.content
+  };
+}
+
+// Normalize well data using fitted baseline (Step 1)
 function normalizeWithFittedBaseline(wellData, baselineEndTime, method, frac, polyOrder, normalizationMode) {
   if (!wellData || !wellData.time_s || !wellData.values) {
+    return wellData;
+  }
+  if (normalizationMode === 'none') {
     return wellData;
   }
   
@@ -3771,7 +4083,63 @@ function normalizeWithFittedBaseline(wellData, baselineEndTime, method, frac, po
     return wellData; // No baseline data
   }
   
-  // Fit baseline function
+  // Handle lowest_point and first_point modes (don't need fitted baseline)
+  if (normalizationMode === 'lowest_point' || normalizationMode === 'first_point') {
+    let baselineValue;
+    if (normalizationMode === 'lowest_point') {
+      baselineValue = Math.min(...baselineValues);
+    } else { // first_point
+      // Find the first point after the baseline range ends (time > baselineEndTime)
+      const afterBaselinePoints = [];
+      for (let i = 0; i < wellData.time_s.length; i++) {
+        const time = wellData.time_s[i];
+        const value = wellData.values[i];
+        if (time !== null && value !== null && time > baselineEndTime) {
+          afterBaselinePoints.push({ time: time, value: value });
+        }
+      }
+      afterBaselinePoints.sort((a, b) => a.time - b.time);
+      if (afterBaselinePoints.length === 0) {
+        return wellData; // No point after baseline
+      }
+      baselineValue = afterBaselinePoints[0].value;
+    }
+    
+    if (baselineValue === 0 || !isFinite(baselineValue)) {
+      return wellData;
+    }
+    
+    // Normalize all timepoints using constant baseline value
+    const normalizedTimes = [];
+    const normalizedValues = [];
+    const originalValues = [];
+    
+    for (let i = 0; i < wellData.time_s.length; i++) {
+      const time = wellData.time_s[i];
+      const value = wellData.values[i];
+      
+      if (time === null || value === null) continue;
+      
+      const normValue = value / baselineValue;
+      normalizedTimes.push(time);
+      normalizedValues.push(normValue);
+      originalValues.push(value);
+    }
+    
+    if (normalizedTimes.length === 0) {
+      return null;
+    }
+    
+    return {
+      time_s: normalizedTimes,
+      values: normalizedValues,
+      originalValues: originalValues,
+      label: wellData.label,
+      content: wellData.content
+    };
+  }
+  
+  // For other modes, fit baseline function
   const baselineFunc = fitBaselineFunction(baselineTimes, baselineValues, method, frac, polyOrder);
   if (!baselineFunc) {
     return wellData;
@@ -4173,28 +4541,39 @@ function updateChart() {
   
   const ctx = document.getElementById("well-chart").getContext("2d");
 
-  // STEP 1: Check if normalization using fitted baseline is enabled (must be first)
+  // STEP 0: Baseline subtraction
+  const baselineSubtractToggle = document.getElementById("baseline-subtract-toggle");
+  const baselineSubtract = baselineSubtractToggle ? baselineSubtractToggle.checked : false;
+  const baselineSubtractModeSelect = document.getElementById("baseline-subtract-mode");
+  const baselineSubtractMode = baselineSubtractModeSelect ? baselineSubtractModeSelect.value : "lowest_point";
+  const baselineSubtractEndInput = document.getElementById("baseline-subtract-end-time");
+  const baselineSubtractEndTime = baselineSubtractEndInput ? parseFloat(baselineSubtractEndInput.value) || 24 : 24;
+  
+  // STEP 1: Normalization using fitted baseline
   const normalizeBaselineToggle = document.getElementById("normalize-baseline-toggle");
   const normalizeBaseline = normalizeBaselineToggle ? normalizeBaselineToggle.checked : false;
   
-  // STEP 2: Check if triplicate grouping is enabled (requires Step 1)
+  // STEP 2: Triplicate grouping (requires Step 0 OR Step 1)
   const groupTriplicatesToggle = document.getElementById("group-triplicates-toggle");
   const groupTriplicates = groupTriplicatesToggle ? groupTriplicatesToggle.checked : false;
-  
-  // Enforce workflow: Step 2 (grouping) requires Step 1 (normalization)
-  if (groupTriplicates && !normalizeBaseline) {
-    // Disable grouping if normalization is not enabled
+  const step0OrStep1Enabled = baselineSubtract || normalizeBaseline;
+  if (groupTriplicates && !step0OrStep1Enabled) {
     if (groupTriplicatesToggle) {
       groupTriplicatesToggle.checked = false;
     }
     groupTriplicates = false;
   }
   
-  // STEP 0: Check if individual wells should be shown
-  // Step 0 only shows when NO other processing steps (1-2) are enabled
+  // Show/hide Step 0 (baseline subtraction) parameters
+  const baselineSubtractParamsDiv = document.getElementById("baseline-subtract-parameters");
+  if (baselineSubtractParamsDiv && baselineSubtractToggle) {
+    baselineSubtractParamsDiv.style.display = baselineSubtract ? "block" : "none";
+  }
+  
+  // Legacy "Step 0": show individual wells when NO other processing (1-2) enabled
   const showIndividualWellsToggle = document.getElementById("show-individual-wells-toggle");
   const step0Requested = showIndividualWellsToggle ? showIndividualWellsToggle.checked : true;
-  const anyProcessingStepEnabled = normalizeBaseline || groupTriplicates;
+  const anyProcessingStepEnabled = baselineSubtract || normalizeBaseline || groupTriplicates;
   // Show Step 0 if requested AND no other steps enabled
   // If no steps are enabled at all, default to showing Step 0 (raw data) as fallback
   const showIndividualWells = (step0Requested && !anyProcessingStepEnabled) || (!anyProcessingStepEnabled);
@@ -4213,6 +4592,8 @@ function updateChart() {
   // Get normalization baseline parameters
   const normalizeBaselineEndInput = document.getElementById("normalize-baseline-end-time");
   const normalizeBaselineEndTime = normalizeBaselineEndInput ? parseFloat(normalizeBaselineEndInput.value) || 24 : 24;
+  // Baseline end used for Step 0 and for cutoff: prefer Step 1's when both enabled
+  const processingBaselineEnd = normalizeBaseline ? normalizeBaselineEndTime : (baselineSubtract ? baselineSubtractEndTime : 24);
   
   // Get baseline fitting method and parameters
   const baselineMethodSelect = document.getElementById("baseline-method-select");
@@ -4273,12 +4654,22 @@ function updateChart() {
     // Clear the chart if no wells selected
     // Determine y-axis label based on processing steps
     let yAxisLabel = "Fluorescence (FI)";
-    if (normalizeBaseline) {
-      if (normalizationMode === 'delta_f_over_f') {
+    if (baselineSubtract && normalizeBaseline) {
+      yAxisLabel = "ΔF/F (Normalized)";
+    } else if (normalizeBaseline) {
+      if (normalizationMode === 'none') {
+        yAxisLabel = "Fluorescence (FI)";
+      } else if (normalizationMode === 'delta_f_over_f') {
         yAxisLabel = "ΔF/F (Normalized)";
+      } else if (normalizationMode === 'lowest_point') {
+        yAxisLabel = "F/F_min (Normalized)";
+      } else if (normalizationMode === 'first_point') {
+        yAxisLabel = "F/F_first (Normalized)";
       } else {
         yAxisLabel = "F/F₀ (Normalized)";
       }
+    } else if (baselineSubtract) {
+      yAxisLabel = "ΔF (FI)";
     }
     if (chart) {
       // Transform existing chart
@@ -4468,9 +4859,15 @@ function updateChart() {
             w => w.wellId === wellId && w.plateId === plateId
           );
           if (!exists) {
-            // STEP 1: Apply normalization using fitted baseline if enabled (must happen before grouping)
             let processedWellData = wellData;
-            if (normalizeBaseline) {
+            const bsBaselineEnd = normalizeBaseline ? normalizeBaselineEndTime : baselineSubtractEndTime;
+            if (baselineSubtract && normalizeBaseline) {
+              processedWellData = baselineSubtractAndNormalizeWellData(processedWellData, bsBaselineEnd, baselineSubtractMode);
+              if (!processedWellData) return;
+            } else if (baselineSubtract) {
+              processedWellData = baselineSubtractWellData(processedWellData, bsBaselineEnd, baselineSubtractMode);
+              if (!processedWellData) return;
+            } else if (normalizeBaseline) {
               processedWellData = normalizeWithFittedBaseline(
                 processedWellData,
                 normalizeBaselineEndTime,
@@ -4479,10 +4876,8 @@ function updateChart() {
                 baselinePolyOrder,
                 normalizationMode
               );
-              if (!processedWellData) return; // Skip if normalization failed
+              if (!processedWellData) return;
             }
-            // Add to group (Step 2 happens here - grouping)
-            // Step 3 (averaging) will be applied later
             groupedSelections[groupKey].wells.push({
               wellId: wellId,
               plateId: plateId,
@@ -4557,9 +4952,15 @@ function updateChart() {
     if (wellData) {
       const existing = groupedSelections[groupKey].wells.find(w => w.wellId === wellId && w.plateId === plateId);
       if (!existing) {
-          // STEP 1: Apply normalization using fitted baseline if enabled (must happen before grouping)
           let processedWellData = wellData;
-          if (normalizeBaseline) {
+          const bsBaselineEnd = normalizeBaseline ? normalizeBaselineEndTime : baselineSubtractEndTime;
+          if (baselineSubtract && normalizeBaseline) {
+            processedWellData = baselineSubtractAndNormalizeWellData(processedWellData, bsBaselineEnd, baselineSubtractMode);
+            if (!processedWellData) return;
+          } else if (baselineSubtract) {
+            processedWellData = baselineSubtractWellData(processedWellData, bsBaselineEnd, baselineSubtractMode);
+            if (!processedWellData) return;
+          } else if (normalizeBaseline) {
             processedWellData = normalizeWithFittedBaseline(
               processedWellData,
               normalizeBaselineEndTime,
@@ -4568,27 +4969,13 @@ function updateChart() {
               baselinePolyOrder,
               normalizationMode
             );
-            if (!processedWellData) return; // Skip if normalization failed
+            if (!processedWellData) return;
           }
-          // STEP 4: Apply normalization using fitted baseline if enabled
-          if (normalizeBaseline) {
-            processedWellData = normalizeWithFittedBaseline(
-              processedWellData,
-              normalizeBaselineEndTime,
-              baselineMethod,
-              baselineFrac,
-              baselinePolyOrder,
-              normalizationMode
-            );
-            if (!processedWellData) return; // Skip if normalization failed
-          }
-          // Add to group (Step 2 happens here - grouping)
-          // Step 3 (averaging) will be applied later
           groupedSelections[groupKey].wells.push({
-          wellId, 
-          plateId, 
-          data: processedWellData
-        });
+            wellId: wellId,
+            plateId: plateId,
+            data: processedWellData
+          });
       }
     }
   });
@@ -4668,9 +5055,9 @@ function updateChart() {
       const firstWellId = group.wells[0].wellId;
       const column = getColumnFromWellId(firstWellId);
       
-      // Add well IDs when Step 1 (normalization) is enabled
+      // Add well IDs when Step 0 or Step 1 is enabled
       let wellIdsPrefix = "";
-      if (normalizeBaseline && group.wells.length > 0) {
+      if (step0OrStep1Enabled && group.wells.length > 0) {
         const wellIds = group.wells.map(w => w.wellId).join(", ");
         wellIdsPrefix = `${wellIds} - `;
       }
@@ -4717,8 +5104,8 @@ function updateChart() {
           let values = well.data.values;
           
           const column = getColumnFromWellId(well.wellId);
-          // Add well ID when Step 1 (normalization) is enabled
-          const wellIdPrefix = normalizeBaseline ? `${well.wellId} - ` : "";
+          // Add well ID when Step 0 or Step 1 is enabled
+          const wellIdPrefix = step0OrStep1Enabled ? `${well.wellId} - ` : "";
           datasets.push({
             label: `${wellIdPrefix}${formattedLabel} Col ${column} (${filename})`,
             data: timePoints.map((t, i) => {
@@ -4758,8 +5145,8 @@ function updateChart() {
         const datasetCount = group.wells.length;
         const column = getColumnFromWellId(wellId);
         const formattedLabel = formatLabel(group.label);
-        // Add well ID when Step 1 (normalization) is enabled
-        const wellIdPrefix = normalizeBaseline ? `${wellId} - ` : "";
+        // Add well ID when Step 0 or Step 1 is enabled
+        const wellIdPrefix = step0OrStep1Enabled ? `${wellId} - ` : "";
         const label = `${wellIdPrefix}${formattedLabel} Col ${column} (${datasetCount} datasets, mean ± SE)`;
         
         datasets.push({
@@ -4788,8 +5175,8 @@ function updateChart() {
         let timePoints = well.data.time_s;
         let values = well.data.values;
         
-        // Add well ID when Step 1 (normalization) is enabled
-        const wellIdPrefix = normalizeBaseline ? `${well.wellId} - ` : "";
+        // Add well ID when Step 0 or Step 1 is enabled
+        const wellIdPrefix = step0OrStep1Enabled ? `${well.wellId} - ` : "";
         const label = formattedLabel 
           ? `${wellIdPrefix}${formattedLabel} Col ${column}` 
           : `${wellIdPrefix}Well ${well.wellId} Col ${column}`;
@@ -4828,9 +5215,9 @@ function updateChart() {
         }
         
         // Determine minimum time to include
-        // If normalization is enabled, exclude baseline period (points before baselineEndTime)
+        // If Step 0 or Step 1 enabled, exclude baseline period (points before processingBaselineEnd)
         // Otherwise, exclude points before first real timepoint
-        const minTime = normalizeBaseline ? normalizeBaselineEndTime : (firstTimepoint !== null ? firstTimepoint : -Infinity);
+        const minTime = step0OrStep1Enabled ? processingBaselineEnd : (firstTimepoint !== null ? firstTimepoint : -Infinity);
         
         // Filter data points: exclude before minTime and after cutoff time
         dataset.data = dataset.data.filter(point => {
@@ -4996,12 +5383,22 @@ function updateChart() {
 
   // Determine y-axis label based on processing steps
   let yAxisLabel = "Fluorescence (FI)";
-  if (normalizeBaseline) {
-    if (normalizationMode === 'delta_f_over_f') {
+  if (baselineSubtract && normalizeBaseline) {
+    yAxisLabel = "ΔF/F (Normalized)";
+  } else if (normalizeBaseline) {
+    if (normalizationMode === 'none') {
+      yAxisLabel = "Fluorescence (FI)";
+    } else if (normalizationMode === 'delta_f_over_f') {
       yAxisLabel = "ΔF/F (Normalized)";
+    } else if (normalizationMode === 'lowest_point') {
+      yAxisLabel = "F/F_min (Normalized)";
+    } else if (normalizationMode === 'first_point') {
+      yAxisLabel = "F/F_first (Normalized)";
     } else {
       yAxisLabel = "F/F₀ (Normalized)";
     }
+  } else if (baselineSubtract) {
+    yAxisLabel = "ΔF (FI)";
   }
 
   // Transform existing chart instead of recreating
@@ -5150,6 +5547,7 @@ def write_web_command(script_dir: str, web_dir: str):
     Create double-clickable launcher files for web server:
     - 'web.command' for macOS/Linux (double-clickable in Finder)
     - 'web.bat' for Windows (double-clickable in Explorer)
+    - 'web_server.ps1' for Windows PowerShell HTTP server (fallback when Python not available)
     """
     web_command_path = os.path.join(script_dir, "web.command")
     
@@ -5216,6 +5614,114 @@ fi
     # Make it executable
     os.chmod(web_command_path, 0o755)
     
+    # Create Windows PowerShell HTTP server script
+    web_server_ps1_path = os.path.join(script_dir, "web_server.ps1")
+    
+    web_server_ps1_content = f"""# PowerShell HTTP Server for Plate Viewer
+# This script serves the web directory without requiring Python
+
+param(
+    [int]$Port = 8000,
+    [string]$WebDir = $PSScriptRoot + "\\web"
+)
+
+# Create HTTP listener
+$listener = New-Object System.Net.HttpListener
+$listener.Prefixes.Add("http://localhost:$Port/")
+
+try {{
+    $listener.Start()
+    Write-Host "============================================================"
+    Write-Host "Plate Viewer Web Server (PowerShell)"
+    Write-Host "============================================================"
+    Write-Host "Server running at: http://localhost:$Port/index.html"
+    Write-Host "Serving directory: $WebDir"
+    Write-Host ""
+    Write-Host "Press Ctrl+C to stop the server"
+    Write-Host "============================================================"
+    Write-Host ""
+
+    # Open browser
+    Start-Sleep -Seconds 2
+    Start-Process "http://localhost:$Port/index.html"
+
+    # Main server loop
+    while ($listener.IsListening) {{
+        $context = $listener.GetContext()
+        $request = $context.Request
+        $response = $context.Response
+
+        # Get the requested file path
+        $localPath = $request.Url.LocalPath
+        if ($localPath -eq '/' -or $localPath -eq '') {{
+            $localPath = '/index.html'
+        }}
+
+        # Build full file path
+        $filePath = Join-Path $WebDir $localPath.TrimStart('/')
+
+        # Check if file exists
+        if (Test-Path $filePath -PathType Leaf) {{
+            try {{
+                # Read file content
+                $content = [System.IO.File]::ReadAllBytes($filePath)
+                $response.ContentLength64 = $content.Length
+                $response.StatusCode = 200
+
+                # Set content type based on file extension
+                $extension = [System.IO.Path]::GetExtension($filePath).ToLower()
+                switch ($extension) {{
+                    '.html' {{ $response.ContentType = 'text/html; charset=utf-8' }}
+                    '.json' {{ $response.ContentType = 'application/json' }}
+                    '.css'  {{ $response.ContentType = 'text/css' }}
+                    '.js'   {{ $response.ContentType = 'application/javascript' }}
+                    '.png'  {{ $response.ContentType = 'image/png' }}
+                    '.jpg'  {{ $response.ContentType = 'image/jpeg' }}
+                    '.jpeg' {{ $response.ContentType = 'image/jpeg' }}
+                    '.gif'  {{ $response.ContentType = 'image/gif' }}
+                    '.svg'  {{ $response.ContentType = 'image/svg+xml' }}
+                    default {{ $response.ContentType = 'application/octet-stream' }}
+                }}
+
+                # Write content to response
+                $response.OutputStream.Write($content, 0, $content.Length)
+            }}
+            catch {{
+                $response.StatusCode = 500
+                $errorMsg = [System.Text.Encoding]::UTF8.GetBytes("500 Internal Server Error: $_")
+                $response.ContentLength64 = $errorMsg.Length
+                $response.OutputStream.Write($errorMsg, 0, $errorMsg.Length)
+            }}
+        }}
+        else {{
+            # File not found
+            $response.StatusCode = 404
+            $notFound = [System.Text.Encoding]::UTF8.GetBytes("404 Not Found: $localPath")
+            $response.ContentLength64 = $notFound.Length
+            $response.ContentType = 'text/plain'
+            $response.OutputStream.Write($notFound, 0, $notFound.Length)
+        }}
+
+        # Close response
+        $response.Close()
+    }}
+}}
+catch {{
+    Write-Host "Error: $_" -ForegroundColor Red
+    Write-Host "Press any key to exit..."
+    $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+}}
+finally {{
+    if ($listener.IsListening) {{
+        $listener.Stop()
+    }}
+    $listener.Close()
+}}
+"""
+    
+    with open(web_server_ps1_path, "w", encoding="utf-8") as f:
+        f.write(web_server_ps1_content)
+    
     # Create Windows .bat file
     web_bat_path = os.path.join(script_dir, "web.bat")
     
@@ -5255,21 +5761,23 @@ echo Press Ctrl+C to stop the server
 echo ============================================================
 echo.
 
-REM Try to open browser automatically after a short delay
-start "" cmd /c "timeout /t 2 /nobreak >nul && start %URL%"
-
-REM Try Python 3 first, then Python 2, then exit with error
+REM Try Python 3 first, then Python 2, then PowerShell HTTP server
 where python3 >nul 2>&1
 if %ERRORLEVEL% == 0 (
+    REM Try to open browser automatically after a short delay
+    start "" cmd /c "timeout /t 2 /nobreak >nul && start %URL%"
     python3 -m http.server %PORT%
 ) else (
     where python >nul 2>&1
     if %ERRORLEVEL% == 0 (
+        REM Try to open browser automatically after a short delay
+        start "" cmd /c "timeout /t 2 /nobreak >nul && start %URL%"
         python -m http.server %PORT%
     ) else (
-        echo Error: Python not found. Please install Python to run a local server.
-        pause
-        exit /b 1
+        echo Using PowerShell HTTP server (no Python required)...
+        echo.
+        REM Use PowerShell script to serve files
+        powershell.exe -ExecutionPolicy Bypass -File "%SCRIPT_DIR%web_server.ps1" -Port %PORT% -WebDir "%WEB_DIR%"
     )
 )
 """
@@ -5284,14 +5792,16 @@ if %ERRORLEVEL% == 0 (
 # Baseline Identification and Normalization Functions
 # ============================================================================
 
-def identify_baseline_window(df: pd.DataFrame, baseline_end_time: float = 24.0) -> Dict[str, pd.DataFrame]:
+def identify_baseline_window(df: pd.DataFrame, baseline_start_time: float = 0.0, baseline_end_time: float = 24.0) -> Dict[str, pd.DataFrame]:
     """
-    For each well column, define the baseline window as all rows with Time_s <= baseline_end_time.
+    For each well column, define the baseline window as all rows with baseline_start_time <= time_s <= baseline_end_time.
     
     Parameters:
     -----------
     df : pd.DataFrame
         Long-format DataFrame with columns ['plate_id', 'well', 'content', 'time_s', 'value']
+    baseline_start_time : float
+        Minimum time (in seconds) for baseline window (default: 0.0)
     baseline_end_time : float
         Maximum time (in seconds) for baseline window (default: 24.0)
     
@@ -5303,7 +5813,7 @@ def identify_baseline_window(df: pd.DataFrame, baseline_end_time: float = 24.0) 
     baseline_data = {}
     
     for well_id, well_df in df.groupby('well'):
-        baseline_mask = well_df['time_s'] <= baseline_end_time
+        baseline_mask = (well_df['time_s'] >= baseline_start_time) & (well_df['time_s'] <= baseline_end_time)
         baseline_data[well_id] = well_df[baseline_mask].copy()
     
     return baseline_data
@@ -5400,6 +5910,7 @@ def fit_baseline(
 
 def fit_well_baselines(
     df: pd.DataFrame,
+    baseline_start_time: float = 0.0,
     baseline_end_time: float = 24.0,
     method: str = 'lowess',
     frac: float = 0.5,
@@ -5414,6 +5925,8 @@ def fit_well_baselines(
     -----------
     df : pd.DataFrame
         Long-format DataFrame with columns ['plate_id', 'well', 'content', 'time_s', 'value']
+    baseline_start_time : float
+        Minimum time (in seconds) for baseline window (default: 0.0)
     baseline_end_time : float
         Maximum time (in seconds) for baseline window (default: 24.0)
     method : str
@@ -5437,7 +5950,7 @@ def fit_well_baselines(
             df = df[~df["well"].apply(lambda w: is_bad_well(w, config))]
     
     # Get baseline windows for each well
-    baseline_windows = identify_baseline_window(df, baseline_end_time)
+    baseline_windows = identify_baseline_window(df, baseline_start_time, baseline_end_time)
     
     # Fit baseline for each well
     for well_id, well_df in df.groupby('well'):
@@ -5517,7 +6030,10 @@ def fit_well_baselines(
 def normalize_wells(
     df: pd.DataFrame,
     baseline_fits: Dict[str, pd.Series],
-    normalization_mode: str = 'multiplicative'
+    normalization_mode: str = 'multiplicative',
+    baseline_windows: Dict[str, pd.DataFrame] = None,
+    baseline_start_time: float = 0.0,
+    baseline_end_time: float = 24.0
 ) -> pd.DataFrame:
     """
     For each well and each timepoint, compute normalized fluorescence using the fitted baseline.
@@ -5537,21 +6053,87 @@ def normalize_wells(
         - 'multiplicative': Multiplicative normalization. Formula: F_norm(t) = F(t) / g(t)
           Use when you want to normalize by baseline without subtracting. Best for fold-change
           analysis. Values are always positive (ratio to baseline).
+        - 'lowest_point': Use the lowest value in the baseline range. Formula: F_norm(t) = F(t) / min(F_baseline)
+        - 'first_point': Use the first value after the baseline range ends. Formula: F_norm(t) = F(t) / F_first_after_baseline
+    baseline_windows : Dict[str, pd.DataFrame], optional
+        Dictionary mapping well_id to DataFrame containing baseline window data.
+        Required for 'lowest_point' and 'first_point' modes.
+    baseline_start_time : float
+        Minimum time (in seconds) for baseline window (default: 0.0)
+    baseline_end_time : float
+        Maximum time (in seconds) for baseline window (default: 24.0)
     
     Returns:
     --------
     pd.DataFrame
         DataFrame with same shape as input but with normalized 'value' column
     """
+    if normalization_mode == 'none':
+        return df.copy()
+    
     norm_df = df.copy()
     norm_values = []
+    
+    # Pre-compute baseline values for lowest_point and first_point modes
+    baseline_constants = {}
+    if normalization_mode in ['lowest_point', 'first_point']:
+        if normalization_mode == 'lowest_point':
+            if baseline_windows is None:
+                raise ValueError(
+                    f"baseline_windows is required for normalization_mode '{normalization_mode}'"
+                )
+            for well_id, baseline_window in baseline_windows.items():
+                if baseline_window is None or len(baseline_window) == 0:
+                    baseline_constants[well_id] = np.nan
+                    continue
+                
+                # Sort by time to ensure correct ordering
+                baseline_window_sorted = baseline_window.sort_values('time_s')
+                valid_values = baseline_window_sorted['value'].dropna()
+                
+                if len(valid_values) == 0:
+                    baseline_constants[well_id] = np.nan
+                    continue
+                
+                baseline_constants[well_id] = valid_values.min()
+        
+        elif normalization_mode == 'first_point':
+            # For first_point, find the first point after baseline_end_time for each well
+            for well_id, well_df in df.groupby('well'):
+                # Get all points for this well, sorted by time
+                well_df_sorted = well_df.sort_values('time_s')
+                # Find first point after baseline_end_time
+                after_baseline = well_df_sorted[well_df_sorted['time_s'] > baseline_end_time]
+                
+                if len(after_baseline) == 0:
+                    baseline_constants[well_id] = np.nan
+                    continue
+                
+                # Get the first point after baseline (sorted by time, so first row)
+                first_after = after_baseline.iloc[0]
+                if pd.isna(first_after['value']) or first_after['value'] == 0:
+                    baseline_constants[well_id] = np.nan
+                else:
+                    baseline_constants[well_id] = first_after['value']
     
     for idx, row in df.iterrows():
         well_id = row['well']
         time_s = row['time_s']
         value = row['value']
         
-        # Get baseline fit for this well
+        # Handle lowest_point and first_point modes
+        if normalization_mode in ['lowest_point', 'first_point']:
+            baseline_value = baseline_constants.get(well_id)
+            if pd.isna(baseline_value) or baseline_value == 0:
+                norm_values.append(np.nan)
+                continue
+            
+            # For these modes, always use multiplicative normalization
+            norm_value = value / baseline_value
+            norm_values.append(norm_value)
+            continue
+        
+        # For other modes, use fitted baseline
         baseline_series = baseline_fits.get(well_id)
         
         if baseline_series is None or len(baseline_series) == 0:
@@ -5577,7 +6159,7 @@ def normalize_wells(
         else:
             raise ValueError(
                 f"Unknown normalization_mode: {normalization_mode}. "
-                "Choose from 'delta_f_over_f' or 'multiplicative'"
+                "Choose from 'delta_f_over_f', 'multiplicative', 'lowest_point', or 'first_point'"
             )
         
         norm_values.append(norm_value)
@@ -5889,6 +6471,7 @@ def print_baseline_options():
 
 def process_baseline_normalization(
     df: pd.DataFrame,
+    baseline_start_time: float = 0.0,
     baseline_end_time: float = 24.0,
     baseline_method: str = 'constant',
     baseline_frac: float = 0.5,
@@ -5904,6 +6487,8 @@ def process_baseline_normalization(
     -----------
     df : pd.DataFrame
         Long-format DataFrame with columns ['plate_id', 'well', 'content', 'time_s', 'value']
+    baseline_start_time : float
+        Minimum time (in seconds) for baseline window (default: 0.0)
     baseline_end_time : float
         Maximum time (in seconds) for baseline window (default: 24.0)
     baseline_method : str
@@ -5913,7 +6498,7 @@ def process_baseline_normalization(
     baseline_poly_order : int
         Polynomial order for polynomial fit (default: 1)
     normalization_mode : str
-        Normalization mode: 'delta_f_over_f' or 'multiplicative' (default: 'multiplicative')
+        Mode: 'delta_f_over_f', 'multiplicative', 'lowest_point', 'first_point', 'none', 'baseline_subtract_lowest', or 'baseline_subtract_first' (default: 'multiplicative')
     config : Dict[str, Any], optional
         Configuration dictionary. If None, loads from plate_config.json
     output_dir : str, optional
@@ -5931,7 +6516,7 @@ def process_baseline_normalization(
     print("BASELINE IDENTIFICATION AND NORMALIZATION PIPELINE")
     print("=" * 70)
     print(f"\nCurrent Settings:")
-    print(f"  Baseline window: Time_s <= {baseline_end_time} s")
+    print(f"  Baseline window: {baseline_start_time} s <= Time_s <= {baseline_end_time} s")
     print(f"  Baseline method: {baseline_method}")
     if baseline_method == 'lowess':
         print(f"    LOWESS smoothing fraction (frac): {baseline_frac}")
@@ -5959,7 +6544,7 @@ def process_baseline_normalization(
             print(f"Excluding {original_count - filtered_count} data points from bad wells", flush=True)
     
     print("Step 1: Identifying baseline windows...", flush=True)
-    baseline_windows = identify_baseline_window(df, baseline_end_time)
+    baseline_windows = identify_baseline_window(df, baseline_start_time, baseline_end_time)
     print(f"  Identified baseline windows for {len(baseline_windows)} wells", flush=True)
     total_baseline_points = sum(len(bw) for bw in baseline_windows.values())
     print(f"  Total baseline points: {total_baseline_points}", flush=True)
@@ -5967,6 +6552,7 @@ def process_baseline_normalization(
     print("Step 2: Fitting baselines...", flush=True)
     baseline_fits = fit_well_baselines(
         df,
+        baseline_start_time=baseline_start_time,
         baseline_end_time=baseline_end_time,
         method=baseline_method,
         frac=baseline_frac,
@@ -5976,7 +6562,7 @@ def process_baseline_normalization(
     print(f"  Fitted baselines for {len(baseline_fits)} wells", flush=True)
     
     print("Step 3: Normalizing wells...", flush=True)
-    norm_df = normalize_wells(df, baseline_fits, normalization_mode=normalization_mode)
+    norm_df = normalize_wells(df, baseline_fits, normalization_mode=normalization_mode, baseline_windows=baseline_windows, baseline_start_time=baseline_start_time, baseline_end_time=baseline_end_time)
     print(f"  Normalized {len(norm_df)} data points", flush=True)
     
     print("Step 4: Building condition map...", flush=True)
@@ -6020,63 +6606,90 @@ def process_baseline_normalization(
 def prompt_baseline_settings():
     """
     Prompt user for baseline and normalization settings.
-    Returns a tuple of (baseline_end_time, baseline_method, baseline_frac, baseline_poly_order, normalization_mode)
+    Returns a tuple of (baseline_start_time, baseline_end_time, baseline_method, baseline_frac, baseline_poly_order, normalization_mode)
     
     If stdin is not available (non-interactive mode) or command-line arguments are provided,
     returns default values or values from command-line arguments.
     
     Command-line arguments (optional):
+        --baseline-start-time FLOAT
         --baseline-end-time FLOAT
         --baseline-method {constant|lowess|polynomial}
         --baseline-frac FLOAT (for LOWESS)
         --baseline-poly-order INT (for polynomial)
-        --normalization-mode {multiplicative|delta_f_over_f}
+        --normalization-mode {multiplicative|delta_f_over_f|lowest_point|first_point|none|baseline_subtract_lowest|baseline_subtract_first}
     """
     import argparse
     
     # Parse command-line arguments first
     parser = argparse.ArgumentParser(add_help=False)  # Don't show help, we'll handle prompts
+    parser.add_argument('--baseline-start-time', type=float, default=None)
     parser.add_argument('--baseline-end-time', type=float, default=None)
     parser.add_argument('--baseline-method', type=str, choices=['constant', 'lowess', 'polynomial'], default=None)
     parser.add_argument('--baseline-frac', type=float, default=None)
     parser.add_argument('--baseline-poly-order', type=int, default=None)
-    parser.add_argument('--normalization-mode', type=str, choices=['multiplicative', 'delta_f_over_f'], default=None)
+    parser.add_argument('--normalization-mode', type=str, choices=['multiplicative', 'delta_f_over_f', 'lowest_point', 'first_point', 'none', 'baseline_subtract_lowest', 'baseline_subtract_first'], default=None)
     
     # Parse known args only (ignore unknown args that might be used elsewhere)
     args, _ = parser.parse_known_args()
     
     # If all settings provided via command-line, use them (non-interactive)
-    if all([args.baseline_end_time is not None, args.baseline_method is not None, 
+    if all([args.baseline_start_time is not None, args.baseline_end_time is not None, args.baseline_method is not None, 
             args.normalization_mode is not None]):
+        baseline_start_time = args.baseline_start_time
         baseline_end_time = args.baseline_end_time
         baseline_method = args.baseline_method
         baseline_frac = args.baseline_frac if args.baseline_frac is not None else 0.5
         baseline_poly_order = args.baseline_poly_order if args.baseline_poly_order is not None else 1
         
         print("\n✓ Using command-line settings:")
-        print(f"  Baseline window end time: {baseline_end_time} s")
+        print(f"  Baseline window: {baseline_start_time} s to {baseline_end_time} s")
         print(f"  Baseline method: {baseline_method}")
         if baseline_method == 'lowess':
             print(f"  LOWESS smoothing fraction: {baseline_frac}")
         elif baseline_method == 'polynomial':
             print(f"  Polynomial order: {baseline_poly_order}")
         print(f"  Normalization mode: {args.normalization_mode}\n")
-        return baseline_end_time, baseline_method, baseline_frac, baseline_poly_order, args.normalization_mode
+        return baseline_start_time, baseline_end_time, baseline_method, baseline_frac, baseline_poly_order, args.normalization_mode
     
     # Check if stdin is available (interactive mode)
     if not sys.stdin.isatty():
         print("\n⚠️  Running in non-interactive mode. Using default settings:")
-        print("  Baseline window end time: 24.0 s")
+        print("  Baseline window: 0.0 s to 24.0 s")
         print("  Baseline method: constant")
         print("  Normalization mode: multiplicative\n")
-        return 24.0, 'constant', 0.5, 1, 'multiplicative'
+        return 0.0, 24.0, 'constant', 0.5, 1, 'multiplicative'
     
     print("\n" + "=" * 70)
     print("BASELINE AND NORMALIZATION SETTINGS")
     print("=" * 70)
     print("\nThese settings will be used for CSV generation and normalization.")
-    print("You can change them later in the web interface for visualization.")
+    print("In the web viewer: Step 0 (baseline subtraction) and Step 1 (normalization) can be")
+    print("enabled separately; Step 2 (group triplicates) requires Step 0 or Step 1.")
+    print("You can change all of these later in the web interface.")
     print("(Press Enter to accept defaults)\n")
+    
+    # Prompt for baseline start time (use command-line arg if provided)
+    baseline_start_time = None
+    if args.baseline_start_time is not None:
+        baseline_start_time = args.baseline_start_time
+        print(f"Baseline window start time: {baseline_start_time} s (from command-line)")
+    else:
+        while True:
+            try:
+                baseline_start_input = input("Baseline window start time (seconds) [default: 0.0]: ").strip()
+                if not baseline_start_input:
+                    baseline_start_time = 0.0
+                else:
+                    baseline_start_time = float(baseline_start_input)
+                    if baseline_start_time < 0:
+                        print("  ⚠️  Please enter a non-negative number.")
+                        continue
+                break
+            except (ValueError, EOFError, KeyboardInterrupt):
+                print("\n  ⚠️  Using default value: 0.0")
+                baseline_start_time = 0.0
+                break
     
     # Prompt for baseline end time (use command-line arg if provided)
     baseline_end_time = None
@@ -6091,8 +6704,8 @@ def prompt_baseline_settings():
                     baseline_end_time = 24.0
                 else:
                     baseline_end_time = float(baseline_input)
-                    if baseline_end_time <= 0:
-                        print("  ⚠️  Please enter a positive number.")
+                    if baseline_end_time <= baseline_start_time:
+                        print(f"  ⚠️  Please enter a number greater than start time ({baseline_start_time} s).")
                         continue
                 break
             except (ValueError, EOFError, KeyboardInterrupt):
@@ -6184,12 +6797,17 @@ def prompt_baseline_settings():
         normalization_mode = args.normalization_mode
         print(f"\nNormalization mode: {normalization_mode} (from command-line)")
     else:
-        print("\nNormalization mode:")
+        print("\nNormalization / processing mode:")
         print("  1. multiplicative - F(t) / g(t) (default)")
         print("  2. delta_f_over_f - (F(t) - g(t)) / g(t)")
+        print("  3. lowest_point - F(t) / min(F_baseline_range)")
+        print("  4. first_point - F(t) / F_first_after_baseline_range")
+        print("  5. none - no normalization (use raw values)")
+        print("  6. baseline_subtract_lowest - subtract min(baseline) from all points (Step 0 style)")
+        print("  7. baseline_subtract_first - subtract first point after baseline from all points (Step 0 style)")
         while True:
             try:
-                norm_input = input("Select mode [1-2, default: 1]: ").strip()
+                norm_input = input("Select mode [1-7, default: 1]: ").strip()
                 if not norm_input:
                     normalization_mode = 'multiplicative'
                     break
@@ -6199,19 +6817,34 @@ def prompt_baseline_settings():
                 elif norm_input == '2':
                     normalization_mode = 'delta_f_over_f'
                     break
+                elif norm_input == '3':
+                    normalization_mode = 'lowest_point'
+                    break
+                elif norm_input == '4':
+                    normalization_mode = 'first_point'
+                    break
+                elif norm_input == '5':
+                    normalization_mode = 'none'
+                    break
+                elif norm_input == '6':
+                    normalization_mode = 'baseline_subtract_lowest'
+                    break
+                elif norm_input == '7':
+                    normalization_mode = 'baseline_subtract_first'
+                    break
                 else:
-                    print("  ⚠️  Please enter 1 or 2.")
+                    print("  ⚠️  Please enter 1, 2, 3, 4, 5, 6, or 7.")
             except (EOFError, KeyboardInterrupt):
                 print("\n  ⚠️  Using default mode: multiplicative")
                 normalization_mode = 'multiplicative'
                 break
     
     # Only print summary if we prompted (not if all settings came from command-line)
-    if not all([args.baseline_end_time is not None, args.baseline_method is not None, 
+    if not all([args.baseline_start_time is not None, args.baseline_end_time is not None, args.baseline_method is not None, 
                 args.normalization_mode is not None]):
         print("\n" + "=" * 70)
         print("SELECTED SETTINGS:")
-        print(f"  Baseline window end time: {baseline_end_time} s")
+        print(f"  Baseline window: {baseline_start_time} s to {baseline_end_time} s")
         print(f"  Baseline method: {baseline_method}")
         if baseline_method == 'lowess':
             print(f"  LOWESS smoothing fraction: {baseline_frac}")
@@ -6220,7 +6853,7 @@ def prompt_baseline_settings():
         print(f"  Normalization mode: {normalization_mode}")
         print("=" * 70 + "\n")
     
-    return baseline_end_time, baseline_method, baseline_frac, baseline_poly_order, normalization_mode
+    return baseline_start_time, baseline_end_time, baseline_method, baseline_frac, baseline_poly_order, normalization_mode
 
 
 def main():
@@ -6229,7 +6862,7 @@ def main():
     os.chdir(script_dir)
     
     # Prompt for baseline and normalization settings
-    baseline_end_time, baseline_method, baseline_frac, baseline_poly_order, normalization_mode = prompt_baseline_settings()
+    baseline_start_time, baseline_end_time, baseline_method, baseline_frac, baseline_poly_order, normalization_mode = prompt_baseline_settings()
 
     # Find Excel files in this directory
     excel_files = [
@@ -6309,6 +6942,7 @@ def main():
                 csv_root, 
                 config, 
                 fname,
+                baseline_start_time=baseline_start_time,
                 baseline_end_time=baseline_end_time,
                 baseline_method=baseline_method,
                 baseline_frac=baseline_frac,
