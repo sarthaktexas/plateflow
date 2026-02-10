@@ -1228,6 +1228,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         <strong>Step 3:</strong> Cutoff data points before first timepoint and after time point (if enabled)<br>
         <strong>Step 4:</strong> Fit regression curve to data points (if enabled)
       </div>
+      <div style="margin-bottom: 12px;">
+        <button type="button" class="btn" onclick="suggestBaselineKineticsFromData();" title="Detect a large time gap (≥30 s) and set baseline end to the last point before the gap, cutoff to last time point.">Suggest baseline/kinetics from data</button>
+        <span style="font-size: 0.75rem; color: #666; margin-left: 8px;">Detects a ≥12 s gap and sets baseline end and cutoff.</span>
+      </div>
       <label style="display: flex; align-items: center; cursor: pointer; font-size: 0.9rem;">
         <input type="checkbox" id="baseline-subtract-toggle" style="margin-right: 8px; cursor: pointer;" onchange="updateChart();">
         <span><strong>Step 0:</strong> Baseline subtraction</span>
@@ -1246,8 +1250,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
           <label style="display: flex; align-items: center; margin-bottom: 4px;">
             <span style="min-width: 120px;">Reference:</span>
             <select id="baseline-subtract-mode" style="flex: 1; max-width: 220px; padding: 4px; border: 1px solid #ddd; border-radius: 3px; font-size: 0.85rem;" onchange="updateChart();">
-              <option value="lowest_point">Lowest point in baseline range</option>
               <option value="first_point">First point after baseline</option>
+              <option value="lowest_point">Lowest point in baseline range</option>
             </select>
           </label>
         </div>
@@ -1595,6 +1599,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       <div id="chart-toolbar" style="display: flex; gap: 8px; margin-bottom: 8px; align-items: center; flex-wrap: wrap;">
         <button type="button" class="btn" onclick="copyChartAsImage()" title="Copy the current chart to clipboard">Copy as image</button>
         <button type="button" class="btn" onclick="downloadChartAsImage()" title="Save the current chart as a PNG file">Download as image</button>
+        <button type="button" class="btn" onclick="downloadChartAsCSV()" title="Export the chart data as a CSV file">Download as CSV</button>
       </div>
       <canvas id="well-chart"></canvas>
     </div>
@@ -3412,6 +3417,103 @@ function downloadChartAsImage() {
   doDownloadChartAsImage();
 }
 
+function escapeCSVCell(val) {
+  if (val === null || val === undefined) return "";
+  const s = String(val);
+  if (/[,\\n\\r"]/.test(s)) {
+    return '"' + s.replace(/"/g, '""') + '"';
+  }
+  return s;
+}
+
+function downloadChartAsCSV() {
+  if (!chart || !chart.data || !chart.data.datasets || chart.data.datasets.length === 0) {
+    alert("No chart data to export. Select wells and click Update Chart first.");
+    return;
+  }
+  // Only export data series (exclude regression fit lines, which have pointRadius 0)
+  const dataDatasets = chart.data.datasets.filter(function(d) {
+    return d.data && d.data.length > 0 && (d.pointRadius === undefined || d.pointRadius > 0);
+  });
+  if (dataDatasets.length === 0) {
+    alert("No data series to export. Select wells and click Update Chart first.");
+    return;
+  }
+  // Collect all unique time points (x values) and sort
+  const timeSet = {};
+  dataDatasets.forEach(function(ds) {
+    (ds.data || []).forEach(function(pt) {
+      if (pt.x !== null && pt.x !== undefined && isFinite(pt.x)) {
+        timeSet[pt.x] = true;
+      }
+    });
+  });
+  const times = Object.keys(timeSet).map(Number).sort(function(a, b) { return a - b; });
+  if (times.length === 0) {
+    alert("No valid time points to export.");
+    return;
+  }
+  // Build map per dataset: x -> { y, error }
+  const seriesMaps = dataDatasets.map(function(ds) {
+    const m = {};
+    (ds.data || []).forEach(function(pt) {
+      if (pt.x !== null && pt.x !== undefined && isFinite(pt.x)) {
+        m[pt.x] = { y: pt.y, error: pt.error };
+      }
+    });
+    return m;
+  });
+  const hasAnyError = seriesMaps.some(function(m) {
+    return times.some(function(t) {
+      const pt = m[t];
+      return pt && pt.error !== undefined && pt.error !== null;
+    });
+  });
+  // Header row
+  const headerCells = ["Time (s)"];
+  dataDatasets.forEach(function(ds, i) {
+    headerCells.push(escapeCSVCell(ds.label || "Series " + (i + 1)));
+    if (hasAnyError) {
+      headerCells.push(escapeCSVCell((ds.label || "Series " + (i + 1)) + " (SE)"));
+    }
+  });
+  const headerRow = headerCells.join(",");
+  const rows = [headerRow];
+  times.forEach(function(t) {
+    const cells = [escapeCSVCell(t)];
+    dataDatasets.forEach(function(ds, i) {
+      const m = seriesMaps[i];
+      const pt = m[t];
+      if (pt) {
+        cells.push(escapeCSVCell(pt.y !== null && pt.y !== undefined ? pt.y : ""));
+        if (hasAnyError) {
+          cells.push(escapeCSVCell(pt.error !== undefined && pt.error !== null ? pt.error : ""));
+        }
+      } else {
+        cells.push("");
+        if (hasAnyError) cells.push("");
+      }
+    });
+    rows.push(cells.join(","));
+  });
+  var cr = 13, lf = 10;
+  var newline = String.fromCharCode(cr) + String.fromCharCode(lf);
+  var csv = "";
+  for (var i = 0; i < rows.length; i++) {
+    if (i > 0) csv += newline;
+    csv += rows[i];
+  }
+  const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+  const a = document.createElement("a");
+  const now = new Date();
+  const pad = function(n) { return String(n).padStart(2, "0"); };
+  const stamp = now.getFullYear() + "-" + pad(now.getMonth() + 1) + "-" + pad(now.getDate()) + "-" + pad(now.getHours()) + pad(now.getMinutes()) + pad(now.getSeconds());
+  a.download = "plate-viewer-chart-" + stamp + ".csv";
+  a.href = URL.createObjectURL(blob);
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
 function updateWellInfo() {
   const el = document.getElementById("well-info");
   if (selectedWells.size === 0) {
@@ -3593,6 +3695,56 @@ function getAllUniqueTimePoints(wells) {
     }
   });
   return Array.from(allTimePoints).sort((a, b) => a - b);
+}
+
+/** Minimum gap (seconds) between time points to treat as baseline vs kinetics boundary. */
+const DEFAULT_BASELINE_GAP_SECONDS = 12;
+
+/**
+ * Detect baseline end and kinetics range from a large time gap in the data.
+ * Returns { baselineEnd, kineticsStart, lastTime, gapSeconds } or null if no gap >= minGapSeconds.
+ */
+function detectBaselineKineticsFromGap(minGapSeconds = DEFAULT_BASELINE_GAP_SECONDS) {
+  if (!viewerData || !viewerData.plates || viewerData.plates.length === 0) return null;
+  const allWells = [];
+  viewerData.plates.forEach(plate => {
+    if (plate.wells) {
+      Object.values(plate.wells).forEach(well => allWells.push(well));
+    }
+  });
+  if (allWells.length === 0) return null;
+  const times = getAllUniqueTimePoints(allWells);
+  if (times.length < 2) return null;
+  for (let i = 0; i < times.length - 1; i++) {
+    const gap = times[i + 1] - times[i];
+    if (gap >= minGapSeconds) {
+      return {
+        baselineEnd: times[i],
+        kineticsStart: times[i + 1],
+        lastTime: times[times.length - 1],
+        gapSeconds: gap
+      };
+    }
+  }
+  return null;
+}
+
+/** Fill baseline end and optionally cutoff from detected gap; update chart. */
+function suggestBaselineKineticsFromData() {
+  const result = detectBaselineKineticsFromGap();
+  if (!result) {
+    alert("No large time gap (≥ " + DEFAULT_BASELINE_GAP_SECONDS + " s) found in the data. Cannot suggest baseline/kinetics.");
+    return;
+  }
+  const baselineSubEnd = document.getElementById("baseline-subtract-end-time");
+  const normalizeBaselineEnd = document.getElementById("normalize-baseline-end-time");
+  const cutoffInput = document.getElementById("cutoff-baseline-time");
+  if (baselineSubEnd) baselineSubEnd.value = result.baselineEnd;
+  if (normalizeBaselineEnd) normalizeBaselineEnd.value = result.baselineEnd;
+  if (cutoffInput) cutoffInput.value = Math.round(result.lastTime);
+  updateChart();
+  const msg = "Baseline end set to " + result.baselineEnd + " s (gap of " + result.gapSeconds + " s before kinetics). Cutoff set to " + Math.round(result.lastTime) + " s.";
+  if (typeof console !== "undefined" && console.info) console.info(msg);
 }
 
 function calculateMeanAndError(wells, timePoints) {
@@ -5220,9 +5372,10 @@ function updateChart() {
         const minTime = step0OrStep1Enabled ? processingBaselineEnd : (firstTimepoint !== null ? firstTimepoint : -Infinity);
         
         // Filter data points: exclude before minTime and after cutoff time
+        // When baseline is used (Step 0/1), exclude points with x <= baselineEnd so the last baseline point is cropped out
         dataset.data = dataset.data.filter(point => {
           if (point.x === null || !isFinite(point.x)) return false;
-          if (point.x < minTime) return false;
+          if (step0OrStep1Enabled ? point.x <= minTime : point.x < minTime) return false;
           if (point.x > cutoffBaselineTime) return false;
           return true;
         });
@@ -5547,7 +5700,6 @@ def write_web_command(script_dir: str, web_dir: str):
     Create double-clickable launcher files for web server:
     - 'web.command' for macOS/Linux (double-clickable in Finder)
     - 'web.bat' for Windows (double-clickable in Explorer)
-    - 'web_server.ps1' for Windows PowerShell HTTP server (fallback when Python not available)
     """
     web_command_path = os.path.join(script_dir, "web.command")
     
@@ -5614,114 +5766,6 @@ fi
     # Make it executable
     os.chmod(web_command_path, 0o755)
     
-    # Create Windows PowerShell HTTP server script
-    web_server_ps1_path = os.path.join(script_dir, "web_server.ps1")
-    
-    web_server_ps1_content = f"""# PowerShell HTTP Server for Plate Viewer
-# This script serves the web directory without requiring Python
-
-param(
-    [int]$Port = 8000,
-    [string]$WebDir = $PSScriptRoot + "\\web"
-)
-
-# Create HTTP listener
-$listener = New-Object System.Net.HttpListener
-$listener.Prefixes.Add("http://localhost:$Port/")
-
-try {{
-    $listener.Start()
-    Write-Host "============================================================"
-    Write-Host "Plate Viewer Web Server (PowerShell)"
-    Write-Host "============================================================"
-    Write-Host "Server running at: http://localhost:$Port/index.html"
-    Write-Host "Serving directory: $WebDir"
-    Write-Host ""
-    Write-Host "Press Ctrl+C to stop the server"
-    Write-Host "============================================================"
-    Write-Host ""
-
-    # Open browser
-    Start-Sleep -Seconds 2
-    Start-Process "http://localhost:$Port/index.html"
-
-    # Main server loop
-    while ($listener.IsListening) {{
-        $context = $listener.GetContext()
-        $request = $context.Request
-        $response = $context.Response
-
-        # Get the requested file path
-        $localPath = $request.Url.LocalPath
-        if ($localPath -eq '/' -or $localPath -eq '') {{
-            $localPath = '/index.html'
-        }}
-
-        # Build full file path
-        $filePath = Join-Path $WebDir $localPath.TrimStart('/')
-
-        # Check if file exists
-        if (Test-Path $filePath -PathType Leaf) {{
-            try {{
-                # Read file content
-                $content = [System.IO.File]::ReadAllBytes($filePath)
-                $response.ContentLength64 = $content.Length
-                $response.StatusCode = 200
-
-                # Set content type based on file extension
-                $extension = [System.IO.Path]::GetExtension($filePath).ToLower()
-                switch ($extension) {{
-                    '.html' {{ $response.ContentType = 'text/html; charset=utf-8' }}
-                    '.json' {{ $response.ContentType = 'application/json' }}
-                    '.css'  {{ $response.ContentType = 'text/css' }}
-                    '.js'   {{ $response.ContentType = 'application/javascript' }}
-                    '.png'  {{ $response.ContentType = 'image/png' }}
-                    '.jpg'  {{ $response.ContentType = 'image/jpeg' }}
-                    '.jpeg' {{ $response.ContentType = 'image/jpeg' }}
-                    '.gif'  {{ $response.ContentType = 'image/gif' }}
-                    '.svg'  {{ $response.ContentType = 'image/svg+xml' }}
-                    default {{ $response.ContentType = 'application/octet-stream' }}
-                }}
-
-                # Write content to response
-                $response.OutputStream.Write($content, 0, $content.Length)
-            }}
-            catch {{
-                $response.StatusCode = 500
-                $errorMsg = [System.Text.Encoding]::UTF8.GetBytes("500 Internal Server Error: $_")
-                $response.ContentLength64 = $errorMsg.Length
-                $response.OutputStream.Write($errorMsg, 0, $errorMsg.Length)
-            }}
-        }}
-        else {{
-            # File not found
-            $response.StatusCode = 404
-            $notFound = [System.Text.Encoding]::UTF8.GetBytes("404 Not Found: $localPath")
-            $response.ContentLength64 = $notFound.Length
-            $response.ContentType = 'text/plain'
-            $response.OutputStream.Write($notFound, 0, $notFound.Length)
-        }}
-
-        # Close response
-        $response.Close()
-    }}
-}}
-catch {{
-    Write-Host "Error: $_" -ForegroundColor Red
-    Write-Host "Press any key to exit..."
-    $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
-}}
-finally {{
-    if ($listener.IsListening) {{
-        $listener.Stop()
-    }}
-    $listener.Close()
-}}
-"""
-    
-    with open(web_server_ps1_path, "w", encoding="utf-8") as f:
-        f.write(web_server_ps1_content)
-    
     # Create Windows .bat file
     web_bat_path = os.path.join(script_dir, "web.bat")
     
@@ -5761,7 +5805,7 @@ echo Press Ctrl+C to stop the server
 echo ============================================================
 echo.
 
-REM Try Python 3 first, then Python 2, then PowerShell HTTP server
+REM Try Python 3 first, then Python 2, then exit with error
 where python3 >nul 2>&1
 if %ERRORLEVEL% == 0 (
     REM Try to open browser automatically after a short delay
@@ -5774,10 +5818,9 @@ if %ERRORLEVEL% == 0 (
         start "" cmd /c "timeout /t 2 /nobreak >nul && start %URL%"
         python -m http.server %PORT%
     ) else (
-        echo Using PowerShell HTTP server (no Python required)...
-        echo.
-        REM Use PowerShell script to serve files
-        powershell.exe -ExecutionPolicy Bypass -File "%SCRIPT_DIR%web_server.ps1" -Port %PORT% -WebDir "%WEB_DIR%"
+        echo Error: Python not found. Please install Python to run a local server.
+        pause
+        exit /b 1
     )
 )
 """
@@ -6612,6 +6655,7 @@ def prompt_baseline_settings():
     returns default values or values from command-line arguments.
     
     Command-line arguments (optional):
+        --skip-csv                  Skip CSV generation; only generate web files. Does not modify existing csv folder.
         --baseline-start-time FLOAT
         --baseline-end-time FLOAT
         --baseline-method {constant|lowess|polynomial}
@@ -6861,8 +6905,21 @@ def main():
     script_dir = os.path.dirname(os.path.abspath(__file__))
     os.chdir(script_dir)
     
-    # Prompt for baseline and normalization settings
-    baseline_start_time, baseline_end_time, baseline_method, baseline_frac, baseline_poly_order, normalization_mode = prompt_baseline_settings()
+    # Parse --skip-csv first (so we can skip baseline prompts when only generating web files)
+    import argparse as _argparse
+    _skip_parser = _argparse.ArgumentParser()
+    _skip_parser.add_argument('--skip-csv', action='store_true', help='Skip CSV generation; only generate web files. Does not modify existing csv folder.')
+    _skip_args, _ = _skip_parser.parse_known_args()
+    skip_csv = _skip_args.skip_csv
+    
+    if skip_csv:
+        print("Skip CSV generation: enabled (only generating web files; existing csv folder will not be modified).\n", flush=True)
+    
+    # Prompt for baseline and normalization settings (only needed when generating CSVs)
+    if not skip_csv:
+        baseline_start_time, baseline_end_time, baseline_method, baseline_frac, baseline_poly_order, normalization_mode = prompt_baseline_settings()
+    else:
+        baseline_start_time = baseline_end_time = baseline_method = baseline_frac = baseline_poly_order = normalization_mode = None  # unused
 
     # Find Excel files in this directory
     excel_files = [
@@ -6897,12 +6954,12 @@ def main():
     all_plates: Dict[str, pd.DataFrame] = {}
     csv_root = os.path.join(script_dir, "csv")
     
-    # Delete old CSV folder if it exists
-    if os.path.exists(csv_root):
+    # Delete old CSV folder only when generating CSVs
+    if not skip_csv and os.path.exists(csv_root):
         print(f"Deleting existing CSV folder: {csv_root}", flush=True)
         shutil.rmtree(csv_root)
     
-    # Load configuration file early so it can be used for CSV generation
+    # Load configuration file early so it can be used for CSV generation and web
     config_path = os.path.join(script_dir, "plate_config.json")
     config = load_config(config_path)
     
@@ -6937,18 +6994,19 @@ def main():
             pass
         else:
             all_plates[plate_id] = long_df
-            write_csvs_for_plate(
-                long_df, 
-                csv_root, 
-                config, 
-                fname,
-                baseline_start_time=baseline_start_time,
-                baseline_end_time=baseline_end_time,
-                baseline_method=baseline_method,
-                baseline_frac=baseline_frac,
-                baseline_poly_order=baseline_poly_order,
-                normalization_mode=normalization_mode
-            )
+            if not skip_csv:
+                write_csvs_for_plate(
+                    long_df, 
+                    csv_root, 
+                    config, 
+                    fname,
+                    baseline_start_time=baseline_start_time,
+                    baseline_end_time=baseline_end_time,
+                    baseline_method=baseline_method,
+                    baseline_frac=baseline_frac,
+                    baseline_poly_order=baseline_poly_order,
+                    normalization_mode=normalization_mode
+                )
 
     # Check for duplicates and warn
     duplicates_found = False
@@ -6991,7 +7049,10 @@ def main():
 
     print("Done.", flush=True)
     print("Generated:", flush=True)
-    print(f"  CSVs in: {csv_root}", flush=True)
+    if skip_csv:
+        print(f"  CSVs: unchanged (skipped)", flush=True)
+    else:
+        print(f"  CSVs in: {csv_root}", flush=True)
     print(f"  Web viewer: {html_path}", flush=True)
     print(f"  Web launcher (macOS/Linux): {web_command_path}", flush=True)
     print(f"  Web launcher (Windows): {web_bat_path}", flush=True)
