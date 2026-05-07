@@ -1177,7 +1177,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     }
     #plate-grid {
       display: grid;
-      grid-template-columns: auto repeat(%(cols)d, 1fr);
+      grid-template-columns: auto repeat(24, 1fr);
       grid-auto-rows: 32px;
       gap: 2px;
       font-size: 11px;
@@ -1366,7 +1366,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       </div>
       <div style="margin-bottom: 12px;">
         <button type="button" class="btn" onclick="suggestBaselineKineticsFromData();" title="Detect a large time gap (≥30 s) and set baseline end to the last point before the gap, cutoff to last time point.">Suggest baseline/kinetics from data</button>
-        <span style="font-size: 0.75rem; color: #666; margin-left: 8px;">Detects a ≥12 s gap and sets baseline end and cutoff.</span>
+        <span style="font-size: 0.75rem; color: #666; margin-left: 8px;">Detects a ≥30 s gap and sets baseline end and cutoff.</span>
       </div>
       <label style="display: flex; align-items: center; cursor: pointer; font-size: 0.9rem;">
         <input type="checkbox" id="baseline-subtract-toggle" style="margin-right: 8px; cursor: pointer;" onchange="updateChart();">
@@ -1386,8 +1386,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
           <label style="display: flex; align-items: center; margin-bottom: 4px;">
             <span style="min-width: 120px;">Reference:</span>
             <select id="baseline-subtract-mode" style="flex: 1; max-width: 220px; padding: 4px; border: 1px solid #ddd; border-radius: 3px; font-size: 0.85rem;" onchange="updateChart();">
-              <option value="first_point">First point after baseline</option>
               <option value="lowest_point">Lowest point in baseline range</option>
+              <option value="first_point">First point after baseline</option>
             </select>
           </label>
         </div>
@@ -1754,15 +1754,87 @@ let selectedDatasetIds = new Set(); // Set of selected dataset group IDs (e.g., 
 let lastSelectedIndex = -1; // Track last selected index for shift-click
 let enabledDatasets = new Set(); // Set of enabled dataset IDs (empty = all enabled)
 let enabledWells = new Set(); // Set of enabled well IDs (empty = all enabled)
-let enabledColumnsByScientist = {}; // Map: scientist -> Set of enabled column numbers (empty set = all enabled)
+let disabledColumnsByScientist = {}; // Map: plate-grid key -> Set of disabled column numbers (empty set = none disabled)
 let plateIndicatorCleanup = null; // Store cleanup functions for plate indicator event listeners
 
-// Helper function to get enabled columns for a scientist
-function getEnabledColumnsForScientist(scientist) {
-  if (!enabledColumnsByScientist[scientist]) {
-    enabledColumnsByScientist[scientist] = new Set();
+/**
+ * Stable key for grouping plate grids and column-toggle state.
+ * Includes column_group so initials alone cannot collide; adds layout slot when > 0.
+ */
+function columnFilterKeyForPlate(plate) {
+  const sci = plate && plate.column_info ? (plate.column_info.scientist || "") : "";
+  const cg = plate && plate.column_group ? plate.column_group : "";
+  const base = `${sci}\x1e${cg}`;
+  const slotRaw = plate && plate.column_info ? plate.column_info.layout_slot : undefined;
+  const slot = Number(slotRaw);
+  const layoutSlot = Number.isFinite(slot) ? slot : 0;
+  return layoutSlot <= 0 ? base : `${base}\x1eL${layoutSlot}`;
+}
+
+function plateGridTitleForKey(gridKey) {
+  const m = /^([\s\S]*)\x1eL(\d+)$/.exec(gridKey);
+  if (!m) {
+    const sci = (gridKey || "").split("\x1e")[0];
+    return sci || "No Scientist";
   }
-  return enabledColumnsByScientist[scientist];
+  const prefix = m[1];
+  const slot = parseInt(m[2], 10);
+  const sci = prefix.split("\x1e")[0] || "";
+  return `${sci || "No Scientist"} — plate ${slot + 1}`;
+}
+
+/** Older viewer_data.json may omit layout_slot; split stacked plates so UI keys stay distinct */
+function ensureLayoutSlotsOnPlates() {
+  if (!viewerData || !viewerData.plates) return;
+  const buckets = {};
+  viewerData.plates.forEach(plate => {
+    const sci = plate.column_info?.scientist || "";
+    const cg = plate.column_group || "";
+    const key = `${sci}\x1e${cg}`;
+    if (!buckets[key]) buckets[key] = [];
+    buckets[key].push(plate);
+  });
+  Object.values(buckets).forEach(plates => {
+    if (plates.length <= 1) return;
+    const anyMissing = plates.some(p => !p.column_info || !("layout_slot" in p.column_info));
+    if (!anyMissing) return;
+    plates.sort((a, b) => (a.file || a.id || "").localeCompare(b.file || b.id || ""));
+    plates.forEach((p, i) => {
+      if (p.column_info && !("layout_slot" in p.column_info)) {
+        p.column_info.layout_slot = i;
+      }
+    });
+  });
+}
+
+function getDisabledColumnsForPlateGrid(gridKey) {
+  if (!disabledColumnsByScientist[gridKey]) {
+    disabledColumnsByScientist[gridKey] = new Set();
+  }
+  return disabledColumnsByScientist[gridKey];
+}
+
+function uiGridKeyForColumnFilters(plate) {
+  if (!plate) return "";
+  return columnFilterKeyForPlate(plate);
+}
+
+/** Same identity as sidebar plate grids — never merge/average curves across different scientists or layout slots */
+function plateGridKeyForPlateId(plateId) {
+  const plate = viewerData.plates.find(p => p.id === plateId);
+  if (!plate) return `plate:${plateId}`;
+  return columnFilterKeyForPlate(plate);
+}
+
+function wellRefsSpanMultiplePlateGrids(wells) {
+  const keys = new Set((wells || []).map(w => plateGridKeyForPlateId(w.plateId)));
+  return keys.size > 1;
+}
+
+function columnPassesEnabledFilters(plate, actualPlateColumn) {
+  if (!plate) return true;
+  const disabledColumns = getDisabledColumnsForPlateGrid(uiGridKeyForColumnFilters(plate));
+  return !disabledColumns.has(actualPlateColumn);
 }
 
 // Register error bar plugin globally
@@ -1890,11 +1962,18 @@ function displayWarnings() {
     const files = warning.files || [];
     const columns = warning.columns || [];
     const filesStr = files.join(" and ");
-    const columnsStr = columns.length <= 10 
+    const columnsStr = columns.length <= 10
       ? columns.join(", ")
       : columns.slice(0, 10).join(", ") + `, ... (${columns.length} total)`;
-    
-    html += `<div style="margin-bottom: 8px;"><strong>${filesStr}</strong> have duplicate columns: ${columnsStr}</div>`;
+    const meta = [];
+    if (warning.scientist) meta.push(`scientist: ${warning.scientist}`);
+    if (warning.column_group) meta.push(warning.column_group);
+    if (warning.layout_slot != null && warning.layout_slot !== undefined) {
+      meta.push(`plate grid ${warning.layout_slot}`);
+    }
+    const metaStr = meta.length ? ` <span style="font-weight: normal; color: #555;">(${meta.join("; ")})</span>` : "";
+
+    html += `<div style="margin-bottom: 8px;"><strong>${filesStr}</strong>${metaStr} still overlap on the same wells/columns: ${columnsStr}</div>`;
     html += `<div style="margin-left: 16px; font-size: 0.85rem; color: #666; margin-bottom: 12px;">Only data from '<strong>${files[0]}</strong>' (first alphabetically) is used.</div>`;
   });
   
@@ -1905,6 +1984,7 @@ function displayWarnings() {
 async function loadData() {
   const res = await fetch("viewer_data.json");
   viewerData = await res.json();
+  ensureLayoutSlotsOnPlates();
   combineAllWells();
   // Initialize triplicate group colors before rendering
   initializeTriplicateGroupColors();
@@ -2072,7 +2152,7 @@ function handleDatasetItemClick(e, groupId, index) {
   // Reset enabled datasets/wells/columns when changing dataset groups
   enabledDatasets.clear();
   enabledWells.clear();
-  enabledColumnsByScientist = {}; // Clear all scientist-specific column filters
+  disabledColumnsByScientist = {}; // Clear all scientist-specific column filters
   
   renderPlateGrid();
   updateWellInfo();
@@ -2570,36 +2650,35 @@ function renderPlateGrid() {
 
   const selectedDatasets = getSelectedDatasets();
   const allGroupDatasets = getAllDatasetsInGroup();
-  
-  // Group plates by scientist initials
-  const platesByScientist = {}; // scientist -> [plateIds]
+
+  const platesByGridKey = {};
   allGroupDatasets.forEach(plateId => {
     const plate = viewerData.plates.find(p => p.id === plateId);
     if (!plate || !plate.column_info) return;
-    const scientist = plate.column_info.scientist || "";
-    if (!platesByScientist[scientist]) {
-      platesByScientist[scientist] = [];
-    }
-    platesByScientist[scientist].push(plateId);
+    const gridKey = columnFilterKeyForPlate(plate);
+    if (!platesByGridKey[gridKey]) platesByGridKey[gridKey] = [];
+    platesByGridKey[gridKey].push(plateId);
   });
-  
-  // Sort scientists by initials (empty scientist goes last)
-  const sortedScientists = Object.keys(platesByScientist).sort((a, b) => {
-    if (a === "") return 1;
-    if (b === "") return -1;
-    return a.localeCompare(b);
+
+  const sortedLayoutKeys = Object.keys(platesByGridKey).sort((a, b) => {
+    const titleA = plateGridTitleForKey(a);
+    const titleB = plateGridTitleForKey(b);
+    if (titleA === "No Scientist") return 1;
+    if (titleB === "No Scientist") return -1;
+    return titleA.localeCompare(titleB);
   });
-  
-  // Build column info map: column -> { genotype, buffer, scientist }
-  // Use all datasets in group to show all available column groups
-  const columnInfoMap = {}; // column -> { genotype, buffer, scientist }
-  
+
+  function layoutKeyPlateIds(layoutKey) {
+    return platesByGridKey[layoutKey];
+  }
+
+  const columnInfoMap = {};
+
   allGroupDatasets.forEach(plateId => {
     const plate = viewerData.plates.find(p => p.id === plateId);
     if (!plate || !plate.column_info) return;
-    
+
     const columnInfo = plate.column_info;
-    // Find which columns have data for this plate
     const wells = allWellsData[plateId] || {};
     Object.keys(wells).forEach(wellId => {
       const col = getColumnFromWellId(wellId);
@@ -2607,18 +2686,17 @@ function renderPlateGrid() {
         columnInfoMap[col] = {
           genotype: columnInfo.genotype || "",
           buffer: columnInfo.buffer || "",
-          scientist: columnInfo.scientist || ""
+          scientist: columnInfo.scientist || "",
         };
       }
     });
   });
-  
-  // Render a separate grid for each scientist
+
   const plateContainers = [];
-  sortedScientists.forEach((scientist, index) => {
-    const scientistPlateIds = platesByScientist[scientist];
+  sortedLayoutKeys.forEach((layoutKey, index) => {
+    const scientistPlateIds = layoutKeyPlateIds(layoutKey);
     const scientistDatasets = selectedDatasets.filter(id => scientistPlateIds.includes(id));
-    
+
     // Create container for this scientist's grid with scroll snap
     const scientistContainer = document.createElement("div");
     scientistContainer.style.flexShrink = "0";
@@ -2638,12 +2716,12 @@ function renderPlateGrid() {
     scientistLabel.style.fontWeight = "600";
     scientistLabel.style.marginBottom = "8px";
     scientistLabel.style.color = "#333";
-    scientistLabel.textContent = scientist || "No Scientist";
+    scientistLabel.textContent = plateGridTitleForKey(layoutKey);
     scientistContainer.appendChild(scientistLabel);
-    
+
     // Create grid for this scientist
     const grid = document.createElement("div");
-    grid.id = `plate-grid-${scientist || "none"}`;
+    grid.id = `plate-grid-${index}`;
     grid.className = "plate-grid";
     grid.style.display = "grid";
     grid.style.gridTemplateColumns = `auto repeat(${PLATE_COLS}, 1fr)`;
@@ -2661,7 +2739,6 @@ function renderPlateGrid() {
     corner.className = "grid-header";
     grid.appendChild(corner);
 
-    // Column number labels
     for (let c = 1; c <= PLATE_COLS; c++) {
       const div = document.createElement("div");
       div.className = "grid-header col-label";
@@ -2671,30 +2748,21 @@ function renderPlateGrid() {
 
     const wellCounts = {}; // Track how many datasets have data for each well
 
-    // Count datasets per well, filtering by enabled wells
-    // Normalize well IDs to ensure consistent matching (zero-padded format)
-    // Only use datasets for this scientist
     scientistDatasets.forEach(plateId => {
+      const plateObj = viewerData.plates.find(p => p.id === plateId);
       const wells = allWellsData[plateId] || {};
       Object.keys(wells).forEach(wellId => {
-        // Normalize well ID to zero-padded format (e.g., "B5" -> "B05", "B13" -> "B13")
         const normalizedWellId = normalizeWellId(wellId);
-        
-        // Filter by enabledWells if any are set (check both original and normalized)
+
         if (enabledWells.size > 0 && !enabledWells.has(wellId) && !enabledWells.has(normalizedWellId)) {
           return;
         }
-        
-        // Filter by enabledColumns if any are set (scientist-specific)
-        // Use the scientist from the outer loop (all plates in scientistDatasets have the same scientist)
+
         const column = getColumnFromWellId(wellId);
-        const enabledColumns = getEnabledColumnsForScientist(scientist);
-        if (enabledColumns.size > 0 && !enabledColumns.has(column)) {
-          return;
-        }
-        
+        if (!columnPassesEnabledFilters(plateObj, column)) return;
+
         if (!wellCounts[normalizedWellId]) {
-          wellCounts[normalizedWellId] = new Set(); // Use Set to avoid duplicates
+          wellCounts[normalizedWellId] = new Set();
         }
         wellCounts[normalizedWellId].add(plateId);
       });
@@ -2707,16 +2775,14 @@ function renderPlateGrid() {
 
     // Rows
     PLATE_ROWS.forEach(rowLetter => {
-      // Row label
       const label = document.createElement("div");
       label.className = "grid-header row-label";
       label.textContent = rowLetter;
       grid.appendChild(label);
 
-      // Wells
       for (let col = 1; col <= PLATE_COLS; col++) {
         const wellId = rowLetter + String(col);
-        const normalizedWellId = normalizeWellId(wellId); // Normalize to zero-padded format for matching
+        const normalizedWellId = normalizeWellId(wellId);
         const div = document.createElement("div");
         div.className = "well";
         const hasData = wellCounts.hasOwnProperty(normalizedWellId);
@@ -2811,13 +2877,13 @@ function renderPlateGrid() {
         
         div.addEventListener("click", (e) => {
           e.stopPropagation();
-          // Get all selected datasets that have data for this well (not just current scientist's grid)
-          // This ensures toggles work across all datasets in the selected group
-          const allSelectedDatasets = getSelectedDatasets();
-          const platesWithWell = allSelectedDatasets.filter(plateId => {
+          // Only toggle datasets drawn on this grid (scientistPlateIds). Using every selected
+          // dataset would link column N across separate layout grids that reuse well IDs (e.g. B03).
+          const allowed = new Set(scientistPlateIds);
+          const platesWithWell = getSelectedDatasets().filter(plateId => {
+            if (!allowed.has(plateId)) return false;
             const plateWells = allWellsData[plateId] || {};
-            // Check if this plate has data for this well using normalized format
-            return plateWells[normalizedWellId] || 
+            return plateWells[normalizedWellId] ||
                    Object.keys(plateWells).some(key => normalizeWellId(key) === normalizedWellId);
           });
           toggleWellSelection(wellId, platesWithWell);
@@ -2911,13 +2977,12 @@ function renderPlateGrid() {
   });
   
   // Create visual indicators below the plate grids
-  createPlateIndicators(container, plateContainers, sortedScientists);
-  
-  // Update column legend with dataset mapping (use all datasets in group)
+  createPlateIndicators(container, plateContainers, sortedLayoutKeys.map(k => plateGridTitleForKey(k)));
+
   updateColumnLegend(columnInfoMap, allGroupDatasets);
 }
 
-function createPlateIndicators(container, plateContainers, scientists) {
+function createPlateIndicators(container, plateContainers, gridTitles) {
   if (plateContainers.length === 0) return;
   
   // Remove old event listeners if they exist
@@ -2955,7 +3020,7 @@ function createPlateIndicators(container, plateContainers, scientists) {
   
   // Create indicator dots for each plate
   const indicators = [];
-  scientists.forEach((scientist, index) => {
+  gridTitles.forEach((title, index) => {
     const indicator = document.createElement("div");
     indicator.className = "plate-indicator";
     indicator.dataset.index = index;
@@ -2989,7 +3054,7 @@ function createPlateIndicators(container, plateContainers, scientists) {
     });
     
     // Add tooltip with scientist name
-    indicator.title = scientist || "No Scientist";
+    indicator.title = title || "No Scientist";
     
     indicatorContainer.appendChild(indicator);
     indicators.push(indicator);
@@ -3064,7 +3129,7 @@ function createPlateIndicators(container, plateContainers, scientists) {
 function updateColumnLegend(columnInfoMap, allDatasets) {
   const legendDiv = document.getElementById("column-legend-content");
   if (!legendDiv) return;
-  
+
   // Build map: column -> { datasets: Set, info: { genotype, buffer, scientist } }
   const columnData = {}; // column -> { datasets: Set, info: {} }
   
@@ -3157,11 +3222,10 @@ function updateColumnLegend(columnInfoMap, allDatasets) {
     colDatasets.forEach(plateId => {
       const plate = viewerData.plates.find(p => p.id === plateId);
       const filename = plate ? (plate.file || plate.id) : plateId;
-      const scientist = plate && plate.column_info ? (plate.column_info.scientist || "") : "";
-      
-      // Check if this column is enabled for this scientist's datasets
-      const enabledColumns = getEnabledColumnsForScientist(scientist);
-      const columnEnabled = enabledColumns.size === 0 || enabledColumns.has(col);
+      const gridKey = uiGridKeyForColumnFilters(plate);
+
+      const disabledColumns = getDisabledColumnsForPlateGrid(gridKey);
+      const columnEnabled = !disabledColumns.has(col);
       
       const datasetDiv = document.createElement("div");
       datasetDiv.style.marginLeft = "8px";
@@ -3177,76 +3241,26 @@ function updateColumnLegend(columnInfoMap, allDatasets) {
       checkbox.style.cursor = "pointer";
       checkbox.dataset.column = col;
       checkbox.dataset.plateId = plateId;
-      checkbox.dataset.scientist = scientist;
-      
+      checkbox.dataset.gridKey = gridKey;
+
       checkbox.addEventListener("change", (e) => {
         const column = parseInt(e.target.dataset.column);
-        const scientist = e.target.dataset.scientist || "";
-        
-        // Get enabled columns for this scientist
-        const enabledColumns = getEnabledColumnsForScientist(scientist);
-        
-        // Get all columns that have data for this scientist's datasets
-        const allColumnsWithData = new Set();
-        allDatasets.forEach(pId => {
-          const p = viewerData.plates.find(pl => pl.id === pId);
-          const pScientist = p && p.column_info ? (p.column_info.scientist || "") : "";
-          if (pScientist === scientist) {
-            const wells = allWellsData[pId] || {};
-            Object.keys(wells).forEach(wellId => {
-              const col = getColumnFromWellId(wellId);
-              allColumnsWithData.add(col);
-            });
-          }
-        });
-        
+        const gridKey = e.target.dataset.gridKey || "";
+
+        const disabledColumns = getDisabledColumnsForPlateGrid(gridKey);
+
         if (e.target.checked) {
-          // Enabling: add column to enabled set for this scientist
-          enabledColumns.add(column);
-          
-          // If all columns that have data are now enabled, clear the set (meaning all enabled)
-          // This optimizes storage: empty set = all enabled, non-empty set = only these enabled
-          const allColumnsEnabled = Array.from(allColumnsWithData).every(col => enabledColumns.has(col));
-          if (allColumnsEnabled && enabledColumns.size === allColumnsWithData.size) {
-            enabledColumns.clear();
-          }
+          disabledColumns.delete(column);
         } else {
-          // Disabling: if set is empty (all enabled), populate it with all columns except the one being unchecked
-          if (enabledColumns.size === 0) {
-            // Currently all are enabled, so populate set with all columns except the one being unchecked
-            allColumnsWithData.forEach(col => {
-              if (col !== column) {
-                enabledColumns.add(col);
-              }
-            });
-          } else {
-            // Some columns are already disabled, remove this one from enabled set
-            const hadColumn = enabledColumns.has(column);
-            enabledColumns.delete(column);
-            
-            // Only re-enable if we just deleted the last enabled column (prevent disabling everything)
-            // But only if there are other columns available
-            if (enabledColumns.size === 0 && allColumnsWithData.size > 1 && hadColumn) {
-              // Re-enable all columns except the one being unchecked
-              allColumnsWithData.forEach(col => {
-                if (col !== column) {
-                  enabledColumns.add(col);
-                }
-              });
-            }
-          }
+          disabledColumns.add(column);
         }
         
-        // Update all checkboxes for all columns for this scientist to reflect the new state
-        // We need to update checkboxes for all columns, not just the one that was toggled
         const allGroupDatasets = getAllDatasetsInGroup();
         for (let c = 1; c <= PLATE_COLS; c++) {
-          // Find all datasets for this column and scientist
           const datasetsForCol = [];
           allGroupDatasets.forEach(pId => {
             const p = viewerData.plates.find(pl => pl.id === pId);
-            const pScientist = p && p.column_info ? (p.column_info.scientist || "") : "";
-            if (pScientist === scientist) {
+            if (uiGridKeyForColumnFilters(p) === gridKey) {
               const wells = allWellsData[pId] || {};
               const hasDataInColumn = Object.keys(wells).some(wellId => {
                 const wellCol = getColumnFromWellId(wellId);
@@ -3262,8 +3276,7 @@ function updateColumnLegend(columnInfoMap, allDatasets) {
           datasetsForCol.forEach(pId => {
             const cb = document.getElementById(`column-${c}-dataset-${pId}`);
             if (cb) {
-              const isEnabled = enabledColumns.size === 0 || enabledColumns.has(c);
-              cb.checked = isEnabled;
+              cb.checked = !disabledColumns.has(c);
             }
           });
         }
@@ -3556,39 +3569,64 @@ function downloadChartAsImage() {
 function escapeCSVCell(val) {
   if (val === null || val === undefined) return "";
   const s = String(val);
-  if (/[,\\n\\r"]/.test(s)) {
+  if (/[,\n\r"]/.test(s)) {
     return '"' + s.replace(/"/g, '""') + '"';
   }
   return s;
 }
 
+// Parse filename with _ separators; last item is date (integer format)
 function getDateFromFilename(filename) {
   if (!filename) return "";
-  const base = String(filename).replace(/\\.[^/.]+$/, "");
+  const base = String(filename).replace(/\.[^/.]+$/, "");
   const parts = base.split("_");
   const last = parts[parts.length - 1];
-  return /^\\d+$/.test(last) ? last : "";
+  return /^\d+$/.test(last) ? last : "";
 }
 
-function formatDisplayLabel(shortName, date, proteinName, wellIds) {
+function scientistFromPlate(plate) {
+  if (!plate || !plate.column_info) return "";
+  return String(plate.column_info.scientist || "").trim();
+}
+
+function uniqueScientistsFromWellRefs(wellRefs) {
+  const tags = [...new Set((wellRefs || []).map(w => {
+    const p = viewerData.plates.find(pl => pl.id === w.plateId);
+    return scientistFromPlate(p);
+  }).filter(Boolean))];
+  return tags.join(", ");
+}
+
+// Format: "GTPase-hDBS [SM · 20250210] (Rho_wt_hDBS, E12, F12, G12)"
+function formatDisplayLabel(shortName, date, scientist, proteinName, wellIds) {
   if (!shortName) return "";
-  const datePart = date ? " [" + date + "]" : "";
+  const bracketParts = [];
+  if (scientist) bracketParts.push(scientist);
+  if (date) bracketParts.push(date);
+  const bracket = bracketParts.length ? " [" + bracketParts.join(" · ") + "]" : "";
   const suffixParts = [proteinName, wellIds].filter(Boolean);
   const suffix = suffixParts.length > 0 ? " (" + suffixParts.join(", ") + ")" : "";
-  return shortName + datePart + suffix;
+  return shortName + bracket + suffix;
 }
 
+// Use dataset._shortName etc when available; otherwise parse from label (fallback)
 function getShortLabelForCSV(dataset) {
   const ds = dataset && typeof dataset === "object" ? dataset : null;
   const label = ds ? ds.label : (typeof dataset === "string" ? dataset : "");
   if (ds && ds._shortName !== undefined) {
-    return formatDisplayLabel(ds._shortName, ds._date, ds._proteinName || "", ds._wellIds || "");
+    return formatDisplayLabel(
+      ds._shortName,
+      ds._date || "",
+      ds._scientist || "",
+      ds._proteinName || "",
+      ds._wellIds || ""
+    );
   }
   if (!label) return label;
   let s = String(label).trim();
-  const prefixMatch = s.match(/^([\\w\\s,]+\\s*-\\s*)/);
+  const prefixMatch = s.match(/^([\w\s,]+\s*-\s*)/);
   const wellIdsPrefix = prefixMatch ? prefixMatch[1] : "";
-  s = s.replace(/^[\\w\\s,]+\\s*-\\s*/, '');
+  s = s.replace(/^[\w\s,]+\s*-\s*/, '');
   const beforeParen = s.indexOf(' (');
   const beforeCol = s.indexOf(' Col ');
   let end = s.length;
@@ -3601,6 +3639,24 @@ function getShortLabelForCSV(dataset) {
 function getLegendLabel(dataset) {
   return getShortLabelForCSV(dataset);
 }
+
+/** Shared Chart.js legend label shortening (scientist, date, protein, wells). */
+const PLATE_VIEWER_LEGEND_LABELS_CONFIG = {
+  usePointStyle: true,
+  padding: 15,
+  font: { size: 11 },
+  generateLabels: function(chartObj) {
+    const original = Chart.defaults.plugins.legend.labels.generateLabels;
+    const labels = original.call(this, chartObj);
+    labels.forEach(function(l) {
+      const ds = chartObj.data.datasets[l.datasetIndex];
+      if (ds && ds.label) {
+        l.text = getLegendLabel(ds);
+      }
+    });
+    return labels;
+  }
+};
 
 function downloadChartAsCSV() {
   if (!chart || !chart.data || !chart.data.datasets || chart.data.datasets.length === 0) {
@@ -5027,7 +5083,7 @@ function updateChart() {
             }
           },
           plugins: {
-            legend: { display: false },
+            legend: { display: false, labels: PLATE_VIEWER_LEGEND_LABELS_CONFIG },
             title: { display: true, text: "Select wells to display data" }
           }
         }
@@ -5056,15 +5112,11 @@ function updateChart() {
       const [plateId, wellId] = key.split(":");
       const column = getColumnFromWellId(wellId);
       
-      // Filter by enabledColumns if any are set (scientist-specific)
       const plate = viewerData.plates.find(p => p.id === plateId);
-      const scientist = plate && plate.column_info ? (plate.column_info.scientist || "") : "";
-      const enabledColumns = getEnabledColumnsForScientist(scientist);
-      if (enabledColumns.size > 0 && !enabledColumns.has(column)) {
+      if (!columnPassesEnabledFilters(plate, column)) {
         return;
       }
-      
-      // Filter by enabledWells if any are set
+
       const normalizedWellId = normalizeWellId(wellId);
       if (enabledWells.size > 0 && !enabledWells.has(wellId) && !enabledWells.has(normalizedWellId)) {
         return;
@@ -5103,6 +5155,7 @@ function updateChart() {
           fill: false,
           _shortName: formattedLabel + (isControl ? " Control" : ""),
           _date: getDateFromFilename(fileStep0),
+          _scientist: scientistFromPlate(plateForStep0),
           _proteinName: plateForStep0 ? plateForStep0.column_group : "",
           _wellIds: wellId
         });
@@ -5125,15 +5178,11 @@ function updateChart() {
     const [plateId, wellId] = key.split(":");
     const column = getColumnFromWellId(wellId);
     
-    // Filter by enabledColumns if any are set (scientist-specific)
     const plate = viewerData.plates.find(p => p.id === plateId);
-    const scientist = plate && plate.column_info ? (plate.column_info.scientist || "") : "";
-    const enabledColumns = getEnabledColumnsForScientist(scientist);
-    if (enabledColumns.size > 0 && !enabledColumns.has(column)) {
-      return; // Skip wells from disabled columns
+    if (!columnPassesEnabledFilters(plate, column)) {
+      return;
     }
-    
-    // Filter by enabledWells if any are set (exclude wells)
+
     const normalizedWellId = normalizeWellId(wellId);
     if (enabledWells.size > 0 && !enabledWells.has(wellId) && !enabledWells.has(normalizedWellId)) {
       return; // Skip excluded wells
@@ -5341,93 +5390,108 @@ function updateChart() {
       if (group.wells.length === 0) {
         return; // Skip to next group
       }
-      
-      const color = colors[colorIdx %% colors.length];
-      colorIdx++;
 
     if (group.type === "triplicate" && group.wells.length > 0) {
-      // STEP 3: Average within triplicate group
-      const result = processWellsAndCalculateMean(
-        group.wells.map(w => w.data),
-        false, // No normalization
-        0, // baselineEndTime not used
-        999999 // cutoffTime not used
-      );
-      const timePoints = result.filteredTimePoints;
-      const means = result.normalizedMeans;
-      const errors = result.normalizedErrors;
-      
-      // Create dataset with mean and error information
-      const lineData = timePoints.map((t, i) => {
-        const point = {
+      // Average within triplicate group per viewer plate grid only (never blend scientists/layouts)
+      const byGrid = {};
+      group.wells.forEach(w => {
+        const gk = plateGridKeyForPlateId(w.plateId);
+        if (!byGrid[gk]) byGrid[gk] = [];
+        byGrid[gk].push(w);
+      });
+      Object.keys(byGrid).sort().forEach(gk => {
+        const chunk = byGrid[gk];
+        if (!chunk.length) return;
+
+        const color = colors[colorIdx %% colors.length];
+        colorIdx++;
+
+        const result = processWellsAndCalculateMean(
+          chunk.map(w => w.data),
+          false, // No normalization
+          0, // baselineEndTime not used
+          999999 // cutoffTime not used
+        );
+        const timePoints = result.filteredTimePoints;
+        const means = result.normalizedMeans;
+        const errors = result.normalizedErrors;
+
+        const lineData = timePoints.map((t, i) => ({
           x: t,
           y: means[i],
           error: errors[i]
-        };
-        return point;
-      }).filter(d => d.y !== null);
-      
-      // Get group name from first well's plate
-      const firstPlate = viewerData.plates.find(p => p.id === group.wells[0].plateId);
-      const columnGroupName = firstPlate ? firstPlate.column_group : "";
-      const datasetCount = new Set(group.wells.map(w => w.plateId)).size;
-      const wellCount = group.wells.length;
-      
-      // Create appropriate label based on number of replicates
-      let replicateLabel = "";
-      if (wellCount === 3) {
-        replicateLabel = "triplicate";
-      } else if (wellCount === 6) {
-        replicateLabel = "hexplicate";
-      } else if (wellCount === 9) {
-        replicateLabel = "nonuplicate";
-      } else {
-        replicateLabel = `${wellCount}-plicate`;
-      }
-      
-      // Get column number from first well
-      const firstWellId = group.wells[0].wellId;
-      const column = getColumnFromWellId(firstWellId);
-      
-      // Add well IDs when Step 0 or Step 1 is enabled
-      let wellIdsPrefix = "";
-      if (step0OrStep1Enabled && group.wells.length > 0) {
-        const wellIds = group.wells.map(w => w.wellId).join(", ");
-        wellIdsPrefix = `${wellIds} - `;
-      }
-      
-      const labelSuffix = datasetCount > 1 
-        ? ` (${replicateLabel}, ${datasetCount} datasets, mean ± SE)` 
-        : ` (${replicateLabel}, mean ± SE)`;
-      const formattedName = formatLabel(group.name);
-      const label = columnGroupName 
-        ? `${wellIdsPrefix}${formattedName} (${columnGroupName}) Col ${column}${labelSuffix}`
-        : `${wellIdsPrefix}${formattedName} Col ${column}${labelSuffix}`;
-      const wellIds = group.wells.map(w => w.wellId).filter((v, i, a) => a.indexOf(v) === i).sort().join(", ");
-      const dates = [...new Set(group.wells.map(w => {
-        const p = viewerData.plates.find(pl => pl.id === w.plateId);
-        return getDateFromFilename(p ? (p.file || p.id) : w.plateId);
-      }).filter(Boolean))].join(", ");
-      datasets.push({
-        label: label,
-        data: lineData,
-        borderColor: color,
-        backgroundColor: color.replace("1.0", "0.2"),
-        tension: 0.15,
-        pointRadius: 3,
-        borderWidth: 2,
-        fill: false,
-        _shortName: formattedName,
-        _date: dates,
-        _proteinName: columnGroupName || "",
-        _wellIds: wellIds
+        })).filter(d => d.y !== null);
+
+        const firstPlate = viewerData.plates.find(p => p.id === chunk[0].plateId);
+        const columnGroupName = firstPlate ? firstPlate.column_group : "";
+        const datasetCount = new Set(chunk.map(w => w.plateId)).size;
+        const wellCount = chunk.length;
+
+        let replicateLabel = "";
+        if (wellCount === 3) {
+          replicateLabel = "triplicate";
+        } else if (wellCount === 6) {
+          replicateLabel = "hexplicate";
+        } else if (wellCount === 9) {
+          replicateLabel = "nonuplicate";
+        } else {
+          replicateLabel = `${wellCount}-plicate`;
+        }
+
+        const firstWellId = chunk[0].wellId;
+        const column = getColumnFromWellId(firstWellId);
+
+        let wellIdsPrefix = "";
+        if (step0OrStep1Enabled && chunk.length > 0) {
+          const wellIds = chunk.map(w => w.wellId).join(", ");
+          wellIdsPrefix = `${wellIds} - `;
+        }
+
+        const labelSuffix = datasetCount > 1
+          ? ` (${replicateLabel}, ${datasetCount} datasets, mean ± SE)`
+          : ` (${replicateLabel}, mean ± SE)`;
+        const formattedName = formatLabel(group.name);
+        let label = columnGroupName
+          ? `${wellIdsPrefix}${formattedName} (${columnGroupName}) Col ${column}${labelSuffix}`
+          : `${wellIdsPrefix}${formattedName} Col ${column}${labelSuffix}`;
+        if (Object.keys(byGrid).length > 1) {
+          const sciTag = scientistFromPlate(firstPlate);
+          const slotRaw = firstPlate && firstPlate.column_info ? firstPlate.column_info.layout_slot : 0;
+          const slot = Number(slotRaw);
+          const slotHint = Number.isFinite(slot) && slot > 0 ? ` · plate ${slot + 1}` : "";
+          label += sciTag ? ` — ${sciTag}${slotHint}` : "";
+        }
+        const wellIds = chunk.map(w => w.wellId).filter((v, i, a) => a.indexOf(v) === i).sort().join(", ");
+        const dates = [...new Set(chunk.map(w => {
+          const p = viewerData.plates.find(pl => pl.id === w.plateId);
+          return getDateFromFilename(p ? (p.file || p.id) : w.plateId);
+        }).filter(Boolean))].join(", ");
+        datasets.push({
+          label: label,
+          data: lineData,
+          borderColor: color,
+          backgroundColor: color.replace("1.0", "0.2"),
+          tension: 0.15,
+          pointRadius: 3,
+          borderWidth: 2,
+          fill: false,
+          _shortName: formattedName,
+          _date: dates,
+          _scientist: uniqueScientistsFromWellRefs(chunk),
+          _proteinName: columnGroupName || "",
+          _wellIds: wellIds
+        });
       });
     } else if (group.type === "single") {
-      // Single well - check if it's a duplicate
+      const color = colors[colorIdx %% colors.length];
+      colorIdx++;
+
       const wellId = group.wells[0].wellId;
       const isDuplicate = isDuplicateWell(wellId);
-      
-      if (group.wells.length > 1 && isDuplicate) {
+      const spanMultipleGrids = wellRefsSpanMultiplePlateGrids(group.wells);
+
+      // Duplicate-file warnings OR multiple sidebar plate grids → separate curves (no averaging)
+      if (group.wells.length > 1 && (isDuplicate || spanMultipleGrids)) {
         // Duplicate well - show each dataset separately for comparison
         const lineStyles = ["solid", "dashed", "dotted"];
         const formattedLabel = formatLabel(group.label);
@@ -5463,6 +5527,7 @@ function updateChart() {
             fill: false,
             _shortName: formattedLabel,
             _date: getDateFromFilename(filename),
+            _scientist: scientistFromPlate(plate),
             _proteinName: plate ? plate.column_group : "",
             _wellIds: well.wellId
           });
@@ -5511,6 +5576,7 @@ function updateChart() {
           fill: false,
           _shortName: formattedLabel,
           _date: datesMulti,
+          _scientist: uniqueScientistsFromWellRefs(group.wells),
           _proteinName: firstPlateMulti ? firstPlateMulti.column_group : "",
           _wellIds: wellIdsMulti
         });
@@ -5550,6 +5616,7 @@ function updateChart() {
           borderWidth: 1.5,
           _shortName: formattedLabel || ("Well " + well.wellId),
           _date: getDateFromFilename(fileSingle),
+          _scientist: scientistFromPlate(singlePlate),
           _proteinName: singlePlate ? singlePlate.column_group : "",
           _wellIds: well.wellId
         });
@@ -5796,7 +5863,10 @@ function updateChart() {
     const displayedWellCount = datasets.length;
     chart.options.plugins.title.text = `Time Course - ${displayedWellCount} well(s) selected`;
     chart.options.plugins.legend.display = datasets.length > 0;
-    
+    chart.options.plugins.legend.position = chart.options.plugins.legend.position || "top";
+    chart.options.plugins.legend.onClick = null;
+    chart.options.plugins.legend.labels = PLATE_VIEWER_LEGEND_LABELS_CONFIG;
+
     // Force Chart.js to update - use update() without mode to ensure proper redraw
     chart.update();
   } else {
@@ -5833,24 +5903,7 @@ function updateChart() {
             display: datasets.length > 0, // Show legend when there are datasets
             position: "top",
             onClick: null,
-            labels: {
-              usePointStyle: true,
-              padding: 15,
-              font: {
-                size: 11
-              },
-              generateLabels: function(chart) {
-                const original = Chart.defaults.plugins.legend.labels.generateLabels;
-                const labels = original.call(this, chart);
-                labels.forEach(function(l) {
-                  const ds = chart.data.datasets[l.datasetIndex];
-                  if (ds && ds.label) {
-                    l.text = getLegendLabel(ds);
-                  }
-                });
-                return labels;
-              }
-            }
+            labels: PLATE_VIEWER_LEGEND_LABELS_CONFIG
           },
           title: {
             display: true,
