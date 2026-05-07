@@ -187,7 +187,7 @@ Create or edit `plate_config.json` to customize:
 - **triplicate_groups**: Define groups of wells that are replicates
   - `name`: Condition name for the group
   - `wells`: Array of row letters (e.g., ["B", "C", "D"])
-- **control_rows**: Array of row letters that are control wells (independently selectable, not grouped)
+- **control_rows**: Array of row letters that are control wells (independently selectable, not grouped). When using a plate config, no control rows or triplicate groups are assumed by default; specify explicitly if needed.
 
 If no configuration file exists, the script will auto-generate one with defaults based on the data.
 
@@ -263,21 +263,19 @@ When multiple plates share the same column group but have different scientist in
 The `run_plate_viewer.applescript` file embeds the Python code as base64-encoded text. You can compile it into a quick action which appears in Finder when you right-click a folder.
 Please use Automator to create this.
 
+**AppleScript / Quick Action CSV generation does not work** — it is intentionally disabled in the bundled script. The Quick Action only runs the pipeline with `--skip-csv` so it produces **web viewer files only**. To generate CSV files, run `python3 plate_viewer.py` from Terminal in the folder that contains your `.xlsx` files (see [Basic Usage](#basic-usage)).
+
 ### What the AppleScript Does
 
 The AppleScript:
 1. Prompts user to select a folder containing `.xlsx` files (or uses folder from Automator/Finder)
-2. Optionally shows an introductory dialog explaining baseline and normalization settings (Step 0 / Step 1 / Step 2) for CSV generation and the web viewer
-3. Prompts for **normalization / processing mode**: None (raw values), ΔF/F, Multiplicative, Lowest point, First point after baseline, **Baseline subtract: lowest point (Step 0)**, or **Baseline subtract: first point after baseline (Step 0)** — matching the web viewer’s Step 0 and Step 1
-4. Prompts for **baseline fitting method** (when applicable): LOWESS, constant, or polynomial, with clear labels
-5. Automatically installs required Python packages if needed:
+2. Automatically installs required Python packages if needed:
    - Tries `pip install --user` first
    - Falls back to `--break-system-packages` for Python 3.11+
    - Tries without flags as last resort
-6. Decodes and executes the embedded Python code
-7. Processes all Excel files in the selected folder
-8. Generates CSV files and web viewer
-9. Shows a completion notification
+3. Decodes and executes the embedded Python code with **`--skip-csv`** (web viewer output only; no CSV prompts)
+4. Processes all Excel files in the selected folder and refreshes the web viewer data
+5. Shows a completion notification
 
 **Note**: The Python code is embedded as base64 in the AppleScript. To update it, you would need to:
 1. Encode `plate_viewer.py` to base64

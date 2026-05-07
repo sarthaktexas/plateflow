@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 import os
+import re
 import sys
 import json
 import shutil
-from typing import Dict, Any, List
+from collections import defaultdict
+from typing import Dict, Any, List, Set, Tuple, Optional
 
 import pandas as pd
 import numpy as np
@@ -53,13 +55,14 @@ TRIPLICATE_COLORS = [
 def is_control_well(well_id: str, control_rows: List[str] = None) -> bool:
     """
     Check if a well is a control well.
-    Default control rows are N and O, but this can be configured via control_rows parameter.
+    Control rows are configured via control_rows parameter (e.g. from plate_config.json).
+    When using a plate config, no control rows are assumed if not specified.
     Control wells should be independently selectable and not grouped as triplicates.
     """
     if not well_id:
         return False
     if control_rows is None:
-        control_rows = ["N", "O"]  # Default control rows
+        control_rows = []
     row_letter = well_id[0] if well_id[0].isalpha() else ""
     return row_letter in control_rows
 
@@ -433,18 +436,9 @@ def write_csvs_for_plate(
             # New format: "B" -> use as is
             well_labels[key] = value
     
-    # Also convert DEFAULT_WELL_LABELS to row-based format
-    default_row_labels = {}
-    for key, value in DEFAULT_WELL_LABELS.items():
-        if len(key) > 1 and key[0].isalpha():
-            row_letter = key[0]
-            if row_letter not in default_row_labels:
-                default_row_labels[row_letter] = value
-    
-    # Merge defaults with config (config takes precedence)
-    well_labels = {**default_row_labels, **well_labels}
-    
-    control_rows = config.get("control_rows", ["N", "O"])
+    # When using a plate config, do not assume default well labels or control rows.
+    # Only use what is in the config (no default triplicates or control rows).
+    control_rows = config.get("control_rows", [])
     
     # Auto-generate groups from well_labels
     groups = []
@@ -618,7 +612,7 @@ def write_default_config(config_path: str):
     
     default_config = {
         "well_labels": well_labels,
-        "control_rows": ["N", "O"],
+        "control_rows": [],
         "bad_wells": []
     }
     
@@ -641,7 +635,6 @@ def normalize_well_id(well_id: str) -> str:
     well_id = str(well_id).strip().upper()
     
     # Match pattern: letter followed by digits
-    import re
     match = re.match(r'^([A-Z])(\d+)$', well_id)
     if match:
         row = match.group(1)
@@ -649,6 +642,157 @@ def normalize_well_id(well_id: str) -> str:
         return f"{row}{col:02d}"  # Zero-pad to 2 digits
     
     return well_id
+
+
+def _well_row_col(well_id: str) -> Optional[Tuple[str, int]]:
+    w = normalize_well_id(str(well_id).strip())
+    m = re.match(r"^([A-Z])(\d+)$", w)
+    if not m:
+        return None
+    return m.group(1), int(m.group(2))
+
+
+def _plate_columns_used(df: pd.DataFrame) -> Set[int]:
+    cols: Set[int] = set()
+    for well_id in df["well"].unique():
+        rc = _well_row_col(str(well_id))
+        if rc:
+            cols.add(rc[1])
+    return cols
+
+
+def _remap_plate_well_columns(df: pd.DataFrame, old_to_new_col: Dict[int, int]) -> pd.DataFrame:
+    """Return a copy with plate column indices remapped (only keys present are moved)."""
+    if not old_to_new_col:
+        return df
+    out = df.copy()
+
+    def remap_one(w: Any) -> str:
+        rc = _well_row_col(str(w))
+        if not rc:
+            return str(w).strip()
+        row_letter, col = rc
+        new_c = old_to_new_col.get(col, col)
+        return normalize_well_id(f"{row_letter}{new_c}")
+
+    out["well"] = out["well"].apply(remap_one)
+    return out
+
+
+def resolve_cross_file_well_column_conflicts(
+    all_plates: Dict[str, pd.DataFrame],
+    plate_id_to_filename: Dict[str, str],
+) -> Dict[str, int]:
+    """
+    When multiple Excel files share the same (scientist, column_group) and use overlapping
+    plate columns, remap later files onto free columns within the same 24-column layout when
+    possible; otherwise assign a new layout slot (virtual plate) so well IDs no longer collide.
+
+    Mutates all_plates DataFrames in place when column remapping is applied.
+
+    Returns
+    -------
+    Dict[str, int]
+        plate_id -> layout_slot (0-based index used by the web viewer).
+    """
+    groups: Dict[Tuple[str, str], List[str]] = defaultdict(list)
+    for plate_id in all_plates:
+        fname = plate_id_to_filename.get(plate_id, f"{plate_id}.xlsx")
+        info = parse_column_group_from_filename(fname)
+        scientist = info.get("scientist") or ""
+        column_group = info.get("column_group") or ""
+        groups[(scientist, column_group)].append(plate_id)
+
+    plate_layout_slots: Dict[str, int] = {}
+
+    for (scientist, column_group), plate_ids in groups.items():
+        occupied_per_layout: List[Set[int]] = []
+
+        def ensure_layout(idx: int) -> None:
+            while len(occupied_per_layout) <= idx:
+                occupied_per_layout.append(set())
+
+        if len(plate_ids) <= 1:
+            for pid in plate_ids:
+                plate_layout_slots[pid] = 0
+            continue
+
+        sorted_ids = sorted(plate_ids, key=lambda pid: plate_id_to_filename.get(pid, pid))
+
+        for plate_id in sorted_ids:
+            df = all_plates[plate_id]
+            cols_used = _plate_columns_used(df)
+            fname = plate_id_to_filename.get(plate_id, f"{plate_id}.xlsx")
+
+            if not cols_used:
+                plate_layout_slots[plate_id] = 0
+                continue
+
+            placed = False
+            max_L = len(occupied_per_layout) + 1
+            for L in range(max_L):
+                ensure_layout(L)
+                occ = occupied_per_layout[L]
+                conflict = cols_used & occ
+
+                if not conflict:
+                    plate_layout_slots[plate_id] = L
+                    occ.update(cols_used)
+                    placed = True
+                    if L > 0:
+                        print(
+                            f"  Layout slot {L + 1}: '{fname}' ({scientist}/{column_group}) — "
+                            f"new plate grid (no column remap). Columns: {sorted(cols_used)}",
+                            flush=True,
+                        )
+                    break
+
+                unchanged = cols_used - conflict
+                free_slots = set(range(1, PLATE_COLS + 1)) - occ
+                reserved = set(unchanged)
+                candidates = sorted(free_slots - reserved)
+
+                if len(candidates) < len(conflict):
+                    continue
+
+                sorted_conflicts = sorted(conflict)
+                move_map: Dict[int, int] = {}
+                for old_c, new_c in zip(sorted_conflicts, candidates):
+                    if old_c != new_c:
+                        move_map[old_c] = new_c
+
+                full_map = {c: move_map.get(c, c) for c in cols_used}
+                delta = {o: n for o, n in full_map.items() if o != n}
+                new_df = _remap_plate_well_columns(df, delta)
+                new_cols = _plate_columns_used(new_df)
+                if new_cols & occ:
+                    continue
+
+                all_plates[plate_id] = new_df
+                plate_layout_slots[plate_id] = L
+                occ.update(new_cols)
+                placed = True
+                detail = ", ".join(f"{a}->{b}" for a, b in sorted(delta.items()))
+                print(
+                    f"  Resolved column overlap for '{fname}' ({scientist}/{column_group}) "
+                    f"on layout {L + 1}: {detail}",
+                    flush=True,
+                )
+                break
+
+            if not placed:
+                L = len(occupied_per_layout)
+                ensure_layout(L)
+                occ = occupied_per_layout[L]
+                plate_layout_slots[plate_id] = L
+                occ.update(cols_used)
+                print(
+                    f"  Layout slot {L + 1}: '{fname}' ({scientist}/{column_group}) — "
+                    f"new plate grid (fallback). Columns: {sorted(cols_used)}",
+                    flush=True,
+                )
+
+    return plate_layout_slots
 
 
 def is_bad_well(well_id: str, config: Dict[str, Any] = None) -> bool:
@@ -707,7 +851,13 @@ def load_config(config_path: str) -> Dict[str, Any]:
         return {}
 
 
-def build_viewer_json(all_plates: Dict[str, pd.DataFrame], json_path: str, config: Dict[str, Any] = None, plate_id_to_filename: Dict[str, str] = None):
+def build_viewer_json(
+    all_plates: Dict[str, pd.DataFrame],
+    json_path: str,
+    config: Dict[str, Any] = None,
+    plate_id_to_filename: Dict[str, str] = None,
+    plate_layout_slots: Dict[str, int] = None,
+):
     """
     Build viewer_data.json with structure:
     {
@@ -746,42 +896,28 @@ def build_viewer_json(all_plates: Dict[str, pd.DataFrame], json_path: str, confi
         config = {}
     if plate_id_to_filename is None:
         plate_id_to_filename = {}
+    if plate_layout_slots is None:
+        plate_layout_slots = {}
     
-    # Get control rows from config (default: ["N", "O"])
-    control_rows = config.get("control_rows", ["N", "O"])
+    # Get control rows from config (no default when using plate config)
+    control_rows = config.get("control_rows", [])
     if not isinstance(control_rows, list):
-        control_rows = ["N", "O"]  # Fallback to default if invalid
+        control_rows = []
     
-    # Merge default well labels with config labels (config takes precedence)
-    # Well labels are now row-based (e.g., "B": "label") instead of well-specific (e.g., "B13": "label")
-    # Convert old format to new format for backward compatibility
+    # Use only well labels from config (no default triplicate groups when plate config exists)
+    # Well labels are row-based (e.g., "B": "label") or well-specific (e.g., "B13": "label")
     config_well_labels = config.get("well_labels", {})
     well_labels = {}
     
-    # Process config labels - convert well-specific to row-based if needed
     for key, value in config_well_labels.items():
         if len(key) > 1 and key[0].isalpha() and key[1:].isdigit():
-            # Old format: "B13" -> extract row "B"
             row_letter = key[0]
-            # Use the last non-empty value for each row (in case of duplicates)
             if row_letter not in well_labels:
                 well_labels[row_letter] = value
             elif not well_labels[row_letter] or not well_labels[row_letter].strip():
                 well_labels[row_letter] = value
         else:
-            # New format: "B" -> use as is
             well_labels[key] = value
-    
-    # Also convert DEFAULT_WELL_LABELS to row-based format
-    default_row_labels = {}
-    for key, value in DEFAULT_WELL_LABELS.items():
-        if len(key) > 1 and key[0].isalpha():
-            row_letter = key[0]
-            if row_letter not in default_row_labels:
-                default_row_labels[row_letter] = value
-    
-    # Merge defaults with config (config takes precedence)
-    well_labels = {**default_row_labels, **well_labels}
     
     # Parse column groups from filenames
     column_groups: Dict[str, List[str]] = {}  # column_group -> list of plate_ids
@@ -831,70 +967,62 @@ def build_viewer_json(all_plates: Dict[str, pd.DataFrame], json_path: str, confi
     else:
         print(f"  No groups generated from well_labels", flush=True)
     
-    # Detect duplicate well IDs (same well ID appears in multiple files)
-    # Only flag as duplicate if same scientist AND same well ID
-    # This means duplicate columns in the plate grid
-    # Structure: (scientist, well_id) -> list of filenames
-    scientist_well_to_files: Dict[tuple, List[str]] = {}  # (scientist, well_id) -> list of filenames
-    
-    # Build map of plate_id to scientist for quick lookup
-    plate_id_to_scientist: Dict[str, str] = {}
+    # Detect duplicate well IDs on the same virtual plate layout only.
+    # Structure: (scientist, column_group, layout_slot, well_id) -> list of filenames
+    scientist_well_to_files: Dict[tuple, List[str]] = {}
+
     for plate_id, df in all_plates.items():
         filename = plate_id_to_filename.get(plate_id, plate_id + ".xlsx")
         column_info = plate_column_info.get(plate_id, parse_column_group_from_filename(filename))
         scientist = column_info.get("scientist", "")
-        plate_id_to_scientist[plate_id] = scientist
-    
-    for plate_id, df in all_plates.items():
-        filename = plate_id_to_filename.get(plate_id, plate_id + ".xlsx")
-        scientist = plate_id_to_scientist.get(plate_id, "")
-        # Get all unique well IDs from this plate
+        column_group = column_info.get("column_group", "")
+        layout_slot = int(plate_layout_slots.get(plate_id, 0))
         unique_wells = df["well"].unique()
         for well_id in unique_wells:
-            # Normalize well ID for consistent duplicate detection
             well_id_str = normalize_well_id(str(well_id).strip())
-            key = (scientist, well_id_str)
+            key = (scientist, column_group, layout_slot, well_id_str)
             if key not in scientist_well_to_files:
                 scientist_well_to_files[key] = []
             if filename not in scientist_well_to_files[key]:
                 scientist_well_to_files[key].append(filename)
     
-    # Group duplicates by file pairs for cleaner messaging
-    # Only flag if same scientist AND same well ID
     duplicate_column_warnings = []
-    file_pairs_to_columns: Dict[str, List[int]] = {}  # "file1|file2" -> [column_numbers]
-    
-    for (scientist, well_id), files in scientist_well_to_files.items():
+    warn_groups: Dict[Tuple[tuple, str, str, int], List[int]] = {}
+
+    for (scientist, column_group, layout_slot, well_id), files in scientist_well_to_files.items():
         if len(files) > 1:
-            # Extract column number from well ID (e.g., "B13" -> 13)
-            import re
-            col_match = re.match(r'^[A-Z](\d+)$', well_id)
+            col_match = re.match(r"^[A-Z](\d+)$", well_id)
             if col_match:
                 column_num = int(col_match.group(1))
-                # Sort files alphabetically for consistent ordering
-                sorted_files = sorted(files)
-                file_key = "|".join(sorted_files)
-                if file_key not in file_pairs_to_columns:
-                    file_pairs_to_columns[file_key] = []
-                if column_num not in file_pairs_to_columns[file_key]:
-                    file_pairs_to_columns[file_key].append(column_num)
-    
-    # Build warnings grouped by file pairs - only show column numbers
-    for file_key, column_numbers in file_pairs_to_columns.items():
-        files = file_key.split("|")
+                sorted_files = tuple(sorted(files))
+                gkey = (sorted_files, scientist, column_group, layout_slot)
+                if gkey not in warn_groups:
+                    warn_groups[gkey] = []
+                if column_num not in warn_groups[gkey]:
+                    warn_groups[gkey].append(column_num)
+
+    for gkey, column_numbers in warn_groups.items():
+        sorted_files, scientist, column_group, layout_slot = gkey
+        files = list(sorted_files)
         sorted_columns = sorted(column_numbers)
         duplicate_column_warnings.append({
             "files": files,
-            "columns": sorted_columns  # Changed from well_ids to columns
+            "columns": sorted_columns,
+            "scientist": scientist,
+            "column_group": column_group,
+            "layout_slot": layout_slot + 1,
         })
-        
-        # Console message - only show column numbers
+
         files_str = " and ".join(files)
-        columns_str = ", ".join([str(c) for c in sorted_columns[:10]])  # Show first 10
+        columns_str = ", ".join([str(c) for c in sorted_columns[:10]])
         if len(sorted_columns) > 10:
             columns_str += f", ... ({len(sorted_columns)} total)"
-        print(f"  ⚠️  WARNING: {files_str} have duplicate columns: {columns_str}", flush=True)
-        print(f"     Only data from '{files[0]}' (first alphabetically) is used.", flush=True)
+        print(
+            f"  ⚠️  WARNING: {files_str} still have duplicate wells on the same layout "
+            f"(scientist={scientist}, group={column_group}, layout_slot={layout_slot + 1}): columns {columns_str}",
+            flush=True,
+        )
+        print(f"     Only data from '{files[0]}' (first alphabetically) is used in the viewer.", flush=True)
     
     data = {
         "config": {
@@ -936,7 +1064,8 @@ def build_viewer_json(all_plates: Dict[str, pd.DataFrame], json_path: str, confi
         
         filename = plate_id_to_filename.get(plate_id, plate_id + ".xlsx")
         column_info = plate_column_info.get(plate_id, parse_column_group_from_filename(filename))
-        
+        layout_slot = int(plate_layout_slots.get(plate_id, 0))
+
         plates_list.append(
             {
                 "id": plate_id,
@@ -947,14 +1076,21 @@ def build_viewer_json(all_plates: Dict[str, pd.DataFrame], json_path: str, confi
                     "genotype": column_info["genotype"],
                     "buffer": column_info["buffer"],
                     "scientist": column_info["scientist"],
-                    "number": column_info["number"]
+                    "number": column_info["number"],
+                    "layout_slot": layout_slot,
                 },
                 "wells": wells_dict,
             }
         )
     
-    # Sort plates by scientist initials (empty scientist goes last)
-    plates_list.sort(key=lambda p: (p["column_info"]["scientist"] or "zzz", p["file"]))
+    # Sort plates by scientist initials (empty scientist goes last), then layout slot, then file
+    plates_list.sort(
+        key=lambda p: (
+            p["column_info"]["scientist"] or "zzz",
+            p["column_info"].get("layout_slot", 0),
+            p["file"],
+        )
+    )
     data["plates"] = plates_list
 
     with open(json_path, "w", encoding="utf-8") as f:
@@ -3426,6 +3562,46 @@ function escapeCSVCell(val) {
   return s;
 }
 
+function getDateFromFilename(filename) {
+  if (!filename) return "";
+  const base = String(filename).replace(/\\.[^/.]+$/, "");
+  const parts = base.split("_");
+  const last = parts[parts.length - 1];
+  return /^\\d+$/.test(last) ? last : "";
+}
+
+function formatDisplayLabel(shortName, date, proteinName, wellIds) {
+  if (!shortName) return "";
+  const datePart = date ? " [" + date + "]" : "";
+  const suffixParts = [proteinName, wellIds].filter(Boolean);
+  const suffix = suffixParts.length > 0 ? " (" + suffixParts.join(", ") + ")" : "";
+  return shortName + datePart + suffix;
+}
+
+function getShortLabelForCSV(dataset) {
+  const ds = dataset && typeof dataset === "object" ? dataset : null;
+  const label = ds ? ds.label : (typeof dataset === "string" ? dataset : "");
+  if (ds && ds._shortName !== undefined) {
+    return formatDisplayLabel(ds._shortName, ds._date, ds._proteinName || "", ds._wellIds || "");
+  }
+  if (!label) return label;
+  let s = String(label).trim();
+  const prefixMatch = s.match(/^([\\w\\s,]+\\s*-\\s*)/);
+  const wellIdsPrefix = prefixMatch ? prefixMatch[1] : "";
+  s = s.replace(/^[\\w\\s,]+\\s*-\\s*/, '');
+  const beforeParen = s.indexOf(' (');
+  const beforeCol = s.indexOf(' Col ');
+  let end = s.length;
+  if (beforeParen >= 0) end = Math.min(end, beforeParen);
+  if (beforeCol >= 0) end = Math.min(end, beforeCol);
+  const shortName = s.substring(0, end).trim();
+  return (shortName ? wellIdsPrefix + shortName : label) || label;
+}
+
+function getLegendLabel(dataset) {
+  return getShortLabelForCSV(dataset);
+}
+
 function downloadChartAsCSV() {
   if (!chart || !chart.data || !chart.data.datasets || chart.data.datasets.length === 0) {
     alert("No chart data to export. Select wells and click Update Chart first.");
@@ -3469,12 +3645,13 @@ function downloadChartAsCSV() {
       return pt && pt.error !== undefined && pt.error !== null;
     });
   });
-  // Header row
+  // Header row - use short labels (e.g. "GTPase-hDBS") instead of full chart labels
   const headerCells = ["Time (s)"];
   dataDatasets.forEach(function(ds, i) {
-    headerCells.push(escapeCSVCell(ds.label || "Series " + (i + 1)));
+    const shortLabel = getShortLabelForCSV(ds) || ("Series " + (i + 1));
+    headerCells.push(escapeCSVCell(shortLabel));
     if (hasAnyError) {
-      headerCells.push(escapeCSVCell((ds.label || "Series " + (i + 1)) + " (SE)"));
+      headerCells.push(escapeCSVCell(shortLabel + " (SE)"));
     }
   });
   const headerRow = headerCells.join(",");
@@ -3538,9 +3715,9 @@ function updateWellInfo() {
 }
 
 function isControlWell(wellId) {
-  // Control wells are configurable via control_rows in config (default: ["N", "O"])
+  // Control wells are configurable via control_rows in config (none assumed when using plate config)
   const config = viewerData.config || {};
-  const controlRows = config.control_rows || ["N", "O"];
+  const controlRows = config.control_rows || [];
   const rowLetter = wellId.replace(/[0-9]/g, '');
   return controlRows.includes(rowLetter);
 }
@@ -4912,7 +5089,8 @@ function updateChart() {
         const displayLabel = isControl 
           ? `${wellId} - ${formattedLabel} Control Col ${column}`
           : `${wellId} - ${formattedLabel} Col ${column}`;
-        
+        const plateForStep0 = viewerData.plates.find(p => p.id === plateId);
+        const fileStep0 = plateForStep0 ? (plateForStep0.file || plateForStep0.id) : plateId;
         datasets.push({
           label: displayLabel,
           data: wellData.time_s.map((t, i) => ({ x: t, y: wellData.values[i] })).filter(d => d.y !== null && d.x !== null),
@@ -4922,7 +5100,11 @@ function updateChart() {
           pointRadius: 1.5,
           borderWidth: 1,
           borderDash: [3, 3], // Dashed line for raw data
-          fill: false
+          fill: false,
+          _shortName: formattedLabel + (isControl ? " Control" : ""),
+          _date: getDateFromFilename(fileStep0),
+          _proteinName: plateForStep0 ? plateForStep0.column_group : "",
+          _wellIds: wellId
         });
       }
     });
@@ -5221,7 +5403,11 @@ function updateChart() {
       const label = columnGroupName 
         ? `${wellIdsPrefix}${formattedName} (${columnGroupName}) Col ${column}${labelSuffix}`
         : `${wellIdsPrefix}${formattedName} Col ${column}${labelSuffix}`;
-      
+      const wellIds = group.wells.map(w => w.wellId).filter((v, i, a) => a.indexOf(v) === i).sort().join(", ");
+      const dates = [...new Set(group.wells.map(w => {
+        const p = viewerData.plates.find(pl => pl.id === w.plateId);
+        return getDateFromFilename(p ? (p.file || p.id) : w.plateId);
+      }).filter(Boolean))].join(", ");
       datasets.push({
         label: label,
         data: lineData,
@@ -5230,7 +5416,11 @@ function updateChart() {
         tension: 0.15,
         pointRadius: 3,
         borderWidth: 2,
-        fill: false
+        fill: false,
+        _shortName: formattedName,
+        _date: dates,
+        _proteinName: columnGroupName || "",
+        _wellIds: wellIds
       });
     } else if (group.type === "single") {
       // Single well - check if it's a duplicate
@@ -5271,6 +5461,10 @@ function updateChart() {
             pointRadius: 2,
             borderWidth: 1.5,
             fill: false,
+            _shortName: formattedLabel,
+            _date: getDateFromFilename(filename),
+            _proteinName: plate ? plate.column_group : "",
+            _wellIds: well.wellId
           });
         });
       } else if (group.wells.length > 1) {
@@ -5300,7 +5494,12 @@ function updateChart() {
         // Add well ID when Step 0 or Step 1 is enabled
         const wellIdPrefix = step0OrStep1Enabled ? `${wellId} - ` : "";
         const label = `${wellIdPrefix}${formattedLabel} Col ${column} (${datasetCount} datasets, mean ± SE)`;
-        
+        const wellIdsMulti = group.wells.map(w => w.wellId).filter((v, i, a) => a.indexOf(v) === i).sort().join(", ");
+        const firstPlateMulti = viewerData.plates.find(p => p.id === group.wells[0].plateId);
+        const datesMulti = [...new Set(group.wells.map(w => {
+          const p = viewerData.plates.find(pl => pl.id === w.plateId);
+          return getDateFromFilename(p ? (p.file || p.id) : w.plateId);
+        }).filter(Boolean))].join(", ");
         datasets.push({
           label: label,
           data: lineData,
@@ -5309,7 +5508,11 @@ function updateChart() {
           tension: 0.15,
           pointRadius: 3,
           borderWidth: 2,
-          fill: false
+          fill: false,
+          _shortName: formattedLabel,
+          _date: datesMulti,
+          _proteinName: firstPlateMulti ? firstPlateMulti.column_group : "",
+          _wellIds: wellIdsMulti
         });
       } else {
         // Single dataset for this well
@@ -5332,7 +5535,8 @@ function updateChart() {
         const label = formattedLabel 
           ? `${wellIdPrefix}${formattedLabel} Col ${column}` 
           : `${wellIdPrefix}Well ${well.wellId} Col ${column}`;
-        
+        const singlePlate = viewerData.plates.find(p => p.id === well.plateId);
+        const fileSingle = singlePlate ? (singlePlate.file || singlePlate.id) : well.plateId;
         datasets.push({
           label: label,
           data: timePoints.map((t, i) => {
@@ -5344,6 +5548,10 @@ function updateChart() {
           tension: 0.15,
           pointRadius: 2,
           borderWidth: 1.5,
+          _shortName: formattedLabel || ("Well " + well.wellId),
+          _date: getDateFromFilename(fileSingle),
+          _proteinName: singlePlate ? singlePlate.column_group : "",
+          _wellIds: well.wellId
         });
       }
     }
@@ -5632,10 +5840,14 @@ function updateChart() {
                 size: 11
               },
               generateLabels: function(chart) {
-                // Custom label generation to show color and well name clearly
                 const original = Chart.defaults.plugins.legend.labels.generateLabels;
                 const labels = original.call(this, chart);
-                // Labels already have the correct text from dataset.label
+                labels.forEach(function(l) {
+                  const ds = chart.data.datasets[l.datasetIndex];
+                  if (ds && ds.label) {
+                    l.text = getLegendLabel(ds);
+                  }
+                });
                 return labels;
               }
             }
@@ -5729,35 +5941,38 @@ fi
 
 URL="http://localhost:${{PORT}}/index.html"
 
-echo "============================================================"
-echo "Plate Viewer Web Server"
-echo "============================================================"
-echo "Server running at: $URL"
-echo "Serving directory: $WEB_DIR"
-echo ""
-echo "Press Ctrl+C to stop the server"
-echo "============================================================"
-echo ""
-
-# Try to open browser automatically after a short delay
-(sleep 2 && if command -v open &> /dev/null; then
-    open "$URL" 2>/dev/null && echo "Opened $URL in your default browser" || echo "Please open $URL manually in your browser"
-elif command -v xdg-open &> /dev/null; then
-    xdg-open "$URL" 2>/dev/null && echo "Opened $URL in your default browser" || echo "Please open $URL manually in your browser"
-else
-    echo "Please open $URL manually in your browser"
-fi) &
-
-# Try Python 3 first, then Python 2, then exit with error
+# Start server in background just long enough for the browser to load files
 if command -v python3 &> /dev/null; then
-    python3 -m http.server "$PORT"
+    python3 -m http.server "$PORT" > /dev/null 2>&1 &
 elif command -v python &> /dev/null; then
-    python -m SimpleHTTPServer "$PORT"
+    python -m SimpleHTTPServer "$PORT" > /dev/null 2>&1 &
 else
     echo "Error: Python not found. Please install Python to run a local server."
     read -p "Press Enter to exit..."
     exit 1
 fi
+SERVER_PID=$!
+
+echo "Server started at $URL"
+echo "Opening browser..."
+sleep 2
+if command -v open &> /dev/null; then
+    open "$URL" 2>/dev/null || echo "Please open $URL manually in your browser"
+elif command -v xdg-open &> /dev/null; then
+    xdg-open "$URL" 2>/dev/null || echo "Please open $URL manually in your browser"
+else
+    echo "Please open $URL manually in your browser"
+fi
+
+# Keep server up long enough for initial page + assets to load, then stop it
+sleep 8
+kill "$SERVER_PID" 2>/dev/null || true
+
+# Close this launcher window (macOS Terminal when run by double-click)
+if [ -n "${{TERM_PROGRAM-}}" ] && [ "$TERM_PROGRAM" = "Apple_Terminal" ]; then
+    osascript -e 'tell application "Terminal" to close (front window)' 2>/dev/null
+fi
+exit 0
 """
     
     with open(web_command_path, "w", encoding="utf-8") as f:
@@ -6988,25 +7203,28 @@ def main():
         if plate_id not in plate_id_to_filename:
             plate_id_to_filename[plate_id] = fname
         
-        # If this plate_id already exists, make it unique by appending filename
         if plate_id in all_plates:
-            # This is a duplicate - we'll handle it below
             pass
         else:
             all_plates[plate_id] = long_df
-            if not skip_csv:
-                write_csvs_for_plate(
-                    long_df, 
-                    csv_root, 
-                    config, 
-                    fname,
-                    baseline_start_time=baseline_start_time,
-                    baseline_end_time=baseline_end_time,
-                    baseline_method=baseline_method,
-                    baseline_frac=baseline_frac,
-                    baseline_poly_order=baseline_poly_order,
-                    normalization_mode=normalization_mode
-                )
+
+    print("\nResolving cross-file well/column overlaps (same scientist + condition group)...", flush=True)
+    plate_layout_slots = resolve_cross_file_well_column_conflicts(all_plates, plate_id_to_filename)
+
+    if not skip_csv:
+        for plate_id in sorted(all_plates.keys()):
+            write_csvs_for_plate(
+                all_plates[plate_id],
+                csv_root,
+                config,
+                plate_id_to_filename.get(plate_id, plate_id + ".xlsx"),
+                baseline_start_time=baseline_start_time,
+                baseline_end_time=baseline_end_time,
+                baseline_method=baseline_method,
+                baseline_frac=baseline_frac,
+                baseline_poly_order=baseline_poly_order,
+                normalization_mode=normalization_mode,
+            )
 
     # Check for duplicates and warn
     duplicates_found = False
@@ -7038,7 +7256,7 @@ def main():
     web_dir = os.path.join(script_dir, "web")
     ensure_dir(web_dir)
     json_path = os.path.join(web_dir, "viewer_data.json")
-    build_viewer_json(all_plates, json_path, config, plate_id_to_filename)
+    build_viewer_json(all_plates, json_path, config, plate_id_to_filename, plate_layout_slots)
 
     # Write HTML
     html_path = os.path.join(web_dir, "index.html")
