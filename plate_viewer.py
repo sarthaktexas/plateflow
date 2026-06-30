@@ -3,12 +3,74 @@ import os
 import re
 import sys
 import json
-import shutil
 from collections import defaultdict
 from typing import Dict, Any, List, Set, Tuple, Optional
 
 import pandas as pd
 import numpy as np
+
+# Run-time warning/error log (written to WARNINGS.txt / ERRORS.txt in script dir)
+_run_warnings: List[str] = []
+_run_errors: List[str] = []
+_run_log_dir: Optional[str] = None
+
+
+def clear_run_logs() -> None:
+    """Reset collected warnings and errors for a new run."""
+    global _run_warnings, _run_errors
+    _run_warnings = []
+    _run_errors = []
+
+
+def set_run_log_dir(output_dir: str) -> None:
+    global _run_log_dir
+    _run_log_dir = output_dir
+
+
+def record_warning(message: str) -> None:
+    _run_warnings.append(message)
+    print(f"WARNING: {message}", file=sys.stderr, flush=True)
+
+
+def record_error(message: str) -> None:
+    _run_errors.append(message)
+    print(f"ERROR: {message}", file=sys.stderr, flush=True)
+
+
+def _write_log_file(path: str, title: str, messages: List[str]) -> Optional[str]:
+    if not messages:
+        if os.path.exists(path):
+            os.remove(path)
+        return None
+
+    lines = [title, "=" * len(title), ""] + messages + [""]
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    return path
+
+
+def write_run_log_files(output_dir: Optional[str] = None) -> Tuple[Optional[str], Optional[str]]:
+    """Write collected warnings/errors to WARNINGS.txt and ERRORS.txt."""
+    out_dir = output_dir or _run_log_dir
+    if not out_dir:
+        return None, None
+
+    warnings_path = _write_log_file(
+        os.path.join(out_dir, "WARNINGS.txt"),
+        "Warnings",
+        _run_warnings,
+    )
+    errors_path = _write_log_file(
+        os.path.join(out_dir, "ERRORS.txt"),
+        "Errors",
+        _run_errors,
+    )
+    return warnings_path, errors_path
+
+
+def exit_with_log(exit_code: int = 1, output_dir: Optional[str] = None) -> None:
+    write_run_log_files(output_dir)
+    sys.exit(exit_code)
 
 # ----- CONFIG -----
 # 384-well plate: 16 rows (A-P) x 24 columns; change if needed.
@@ -16,24 +78,6 @@ PLATE_ROWS = "ABCDEFGHIJKLMNOP"  # 16 rows
 PLATE_COLS = 24
 
 SHEET_NAME_PREFERRED = "Table All Data points"  # from your example
-
-# Default well labels and triplicate groups
-DEFAULT_WELL_LABELS = {
-    "B13": "250-10-2",
-    "C13": "250-10-2",
-    "D13": "250-10-2",
-    "E13": "500-10-2",
-    "F13": "500-10-2",
-    "G13": "500-10-2",
-    "H13": "250-5-2",
-    "I13": "250-5-2",
-    "J13": "250-5-2",
-    "K13": "500-5-2",
-    "L13": "500-5-2",
-    "M13": "500-5-2",
-    "N13": "500-10-2",
-    "O13": "500-5-2"
-}
 
 # Color palette for triplicate groups - matches web interface
 # Each group gets a distinct color (using border color for plots)
@@ -171,6 +215,46 @@ def parse_column_group_from_filename(filename: str) -> Dict[str, str]:
     
 
 
+def _cell_str(df: pd.DataFrame, row: int, col: int) -> str:
+    if col >= len(df.columns):
+        return ""
+    val = df.iat[row, col]
+    return "" if pd.isna(val) else str(val).strip()
+
+
+def has_groups_column(df: pd.DataFrame, header_row_idx: int) -> bool:
+    """True when column C of the header row is an optional Group column (ignored)."""
+    return _cell_str(df, header_row_idx, 2).lower() == "group"
+
+
+def find_time_values_start_col(df: pd.DataFrame, time_row_idx: int) -> int:
+    """
+    Column index where numeric time values begin.
+    Scans the time row for a 'Time [s]' label, then the first numeric cell after it
+    (skipping optional Group or other non-numeric columns).
+    """
+    time_label_col = None
+    for col in range(1, len(df.columns)):
+        cell = _cell_str(df, time_row_idx, col)
+        if "Time" in cell and "[s]" in cell:
+            time_label_col = col
+            break
+
+    if time_label_col is not None:
+        for col in range(time_label_col + 1, len(df.columns)):
+            val = df.iat[time_row_idx, col]
+            if pd.isna(val):
+                continue
+            try:
+                float(val)
+                return col
+            except (TypeError, ValueError):
+                continue
+        return time_label_col + 1
+
+    return 2
+
+
 def find_header_and_time_rows(df: pd.DataFrame) -> (int, int):
     """
     Find the 'Well' header row and the 'Time [s]' row.
@@ -180,20 +264,22 @@ def find_header_and_time_rows(df: pd.DataFrame) -> (int, int):
     time_row_idx = None
 
     for i in range(len(df)):
-        cell0 = str(df.iat[i, 0]) if not pd.isna(df.iat[i, 0]) else ""
-        cell1 = str(df.iat[i, 1]) if not pd.isna(df.iat[i, 1]) else ""
-        if cell0.strip() == "Well":
+        if _cell_str(df, i, 0) == "Well":
             header_row_idx = i
-        if "Time" in cell1 and "[s]" in cell1:
-            time_row_idx = i
+        for col in range(len(df.columns)):
+            cell = _cell_str(df, i, col)
+            if "Time" in cell and "[s]" in cell:
+                time_row_idx = i
+                break
 
     if header_row_idx is None or time_row_idx is None:
         raise ValueError("Could not find 'Well' header row or 'Time [s]' row in Excel sheet.")
 
     if time_row_idx != header_row_idx + 1:
         # Not fatal, but warn in case format drifts
-        print(f"Warning: Time row (index {time_row_idx}) is not directly after header row (index {header_row_idx}).",
-              file=sys.stderr)
+        record_warning(
+            f"Time row (index {time_row_idx}) is not directly after header row (index {header_row_idx})."
+        )
 
     return header_row_idx, time_row_idx
 
@@ -212,7 +298,10 @@ def parse_plate_file(xlsx_path: str) -> pd.DataFrame:
             sheet_name = SHEET_NAME_PREFERRED
         else:
             sheet_name = xls.sheet_names[0]
-            print(f"  Sheet '{SHEET_NAME_PREFERRED}' not found; using first sheet '{sheet_name}' instead.", flush=True)
+            record_warning(
+                f"{os.path.basename(xlsx_path)}: sheet '{SHEET_NAME_PREFERRED}' not found; "
+                f"using first sheet '{sheet_name}' instead."
+            )
         print(f"  Reading sheet '{sheet_name}'...", flush=True)
         # Use the same engine for read_excel
         df = pd.read_excel(xlsx_path, sheet_name=sheet_name, header=None, engine='openpyxl')
@@ -230,9 +319,13 @@ def parse_plate_file(xlsx_path: str) -> pd.DataFrame:
     print(f"  Finding header and time rows...", flush=True)
     header_row_idx, time_row_idx = find_header_and_time_rows(df)
 
-    # Time row: column 1 is "Time [s]", measurement times start from column 2 onward.
+    # Optional Group column (column C) is ignored; fluorescence starts after it.
+    time_values_start_col = find_time_values_start_col(df, time_row_idx)
+    if has_groups_column(df, header_row_idx):
+        time_values_start_col = max(time_values_start_col, 3)
+
     time_row = df.iloc[time_row_idx]
-    time_values = time_row.iloc[2:].tolist()
+    time_values = time_row.iloc[time_values_start_col:].tolist()
     # Clean up times
     time_values_clean = []
     for t in time_values:
@@ -266,7 +359,7 @@ def parse_plate_file(xlsx_path: str) -> pd.DataFrame:
         well_id = str(well).strip()
         content_str = "" if pd.isna(content) else str(content).strip()
 
-        row_vals = df.iloc[i, 2:2 + num_time_points].tolist()
+        row_vals = df.iloc[i, time_values_start_col:time_values_start_col + num_time_points].tolist()
         # Ensure same length as time list
         row_vals = row_vals[:num_time_points]
 
@@ -308,320 +401,140 @@ def ensure_dir(path: str):
     os.makedirs(path, exist_ok=True)
 
 
-def write_csvs_for_plate(
-    long_df: pd.DataFrame, 
-    csv_root: str, 
-    config: Dict[str, Any] = None, 
-    filename: str = None,
-    baseline_start_time: float = 0.0,
-    baseline_end_time: float = 20.0,
-    baseline_method: str = 'constant',
-    baseline_frac: float = 0.5,
-    baseline_poly_order: int = 1,
-    normalization_mode: str = 'multiplicative'
-):
-    """
-    Write CSV files:
-      - csv_root/<plate_id>/<plate_id>_<well>.csv (per well, normalized values with baseline)
-      - csv_root/<condition>_<triplicate_name>.csv (per condition-triplicate combination, using normalized values with mean and SEM)
-    
-    Parameters:
-    -----------
-    long_df : pd.DataFrame
-        Long-format DataFrame with columns ['plate_id', 'well', 'content', 'time_s', 'value']
-    csv_root : str
-        Root directory for CSV output
-    config : Dict[str, Any], optional
-        Configuration dictionary
-    filename : str, optional
-        Source filename for parsing column info
-    baseline_start_time : float
-        Minimum time (in seconds) for baseline window (default: 0.0)
-    baseline_end_time : float
-        Maximum time (in seconds) for baseline window (default: 20.0)
-    baseline_method : str
-        Baseline fitting method: 'lowess', 'constant', or 'polynomial' (default: 'constant')
-    baseline_frac : float
-        Fraction of data used for LOWESS smoothing (default: 0.5)
-    baseline_poly_order : int
-        Polynomial order for polynomial fit (default: 1)
-    normalization_mode : str
-        Mode: 'delta_f_over_f', 'multiplicative', 'lowest_point', 'first_point', 'none', 'baseline_subtract_lowest', or 'baseline_subtract_first' (default: 'multiplicative')
-    """
-    plate_id = long_df["plate_id"].iloc[0]
-    print(f"  Writing CSVs for {plate_id}...", flush=True)
-
-    # Load config if not provided
-    if config is None:
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        config_path = os.path.join(script_dir, "plate_config.json")
-        config = load_config(config_path)
-    
-    # Filter out bad wells before processing
-    bad_wells_list = config.get("bad_wells", [])
-    if bad_wells_list:
-        original_count = len(long_df)
-        long_df = long_df[~long_df["well"].apply(lambda w: is_bad_well(w, config))]
-        filtered_count = len(long_df)
-        if original_count != filtered_count:
-            print(f"    Excluding {original_count - filtered_count} data points from bad wells", flush=True)
-    
-    # Normalize, baseline-subtract, or use raw values before writing CSVs
-    if normalization_mode == 'none':
-        print(f"    Skipping normalization (mode: none). Using raw values...", flush=True)
-        norm_df = long_df.copy()
-    elif normalization_mode in ('baseline_subtract_lowest', 'baseline_subtract_first'):
-        print(f"    Baseline subtraction (mode: {normalization_mode})...", flush=True)
-        norm_df = long_df.copy()
-        ref_per_well: Dict[str, float] = {}
-        for well_id, grp in long_df.groupby("well"):
-            grp_sorted = grp.sort_values("time_s")
-            if normalization_mode == 'baseline_subtract_lowest':
-                baseline_vals = grp_sorted.loc[grp_sorted["time_s"] <= baseline_end_time, "value"].dropna()
-                if len(baseline_vals) == 0:
-                    ref_per_well[well_id] = np.nan
-                else:
-                    ref_per_well[well_id] = float(baseline_vals.min())
-            else:
-                after = grp_sorted[grp_sorted["time_s"] > baseline_end_time]
-                if len(after) == 0:
-                    ref_per_well[well_id] = np.nan
-                else:
-                    ref_per_well[well_id] = float(after["value"].iloc[0])
-        norm_df["value"] = norm_df.apply(
-            lambda row: (row["value"] - ref_per_well[row["well"]]) if not np.isnan(ref_per_well.get(row["well"], np.nan)) else row["value"],
-            axis=1
-        )
-        print(f"    ✓ Baseline-subtracted {len(norm_df)} data points", flush=True)
-    else:
-        print(f"    Normalizing data with baseline (method={baseline_method}, mode={normalization_mode})...", flush=True)
-        baseline_windows = identify_baseline_window(long_df, baseline_start_time, baseline_end_time)
-        baseline_fits = fit_well_baselines(
-            long_df,
-            baseline_start_time=baseline_start_time,
-            baseline_end_time=baseline_end_time,
-            method=baseline_method,
-            frac=baseline_frac,
-            poly_order=baseline_poly_order,
-            config=config
-        )
-        norm_df = normalize_wells(long_df, baseline_fits, normalization_mode=normalization_mode, baseline_windows=baseline_windows, baseline_start_time=baseline_start_time, baseline_end_time=baseline_end_time)
-        print(f"    ✓ Normalized {len(norm_df)} data points", flush=True)
-    # Add normalized well ID column for consistent matching
-    norm_df = norm_df.copy()
-    norm_df["well_normalized"] = norm_df["well"].apply(lambda w: normalize_well_id(str(w).strip()))
-    
-    # Parse column info from filename if provided
-    column_info = None
-    if filename:
-        try:
-            column_info = parse_column_group_from_filename(filename)
-        except Exception:
-            pass
-    
-    # Get well_labels and control_rows from config
-    config_well_labels = config.get("well_labels", {})
-    well_labels = {}
-    
-    # Process config labels - convert well-specific to row-based if needed
-    for key, value in config_well_labels.items():
-        if len(key) > 1 and key[0].isalpha() and key[1:].isdigit():
-            # Old format: "B13" -> extract row "B"
-            row_letter = key[0]
-            if row_letter not in well_labels:
-                well_labels[row_letter] = value
-            elif not well_labels[row_letter] or not well_labels[row_letter].strip():
-                well_labels[row_letter] = value
-        else:
-            # New format: "B" -> use as is
-            well_labels[key] = value
-    
-    # When using a plate config, do not assume default well labels or control rows.
-    # Only use what is in the config (no default triplicates or control rows).
-    control_rows = config.get("control_rows", [])
-    
-    # Auto-generate groups from well_labels
-    groups = []
-    label_to_rows: Dict[str, List[str]] = {}
-    
-    # Group row letters by their labels
-    for row_letter, label in well_labels.items():
-        # Filter out control wells
-        if not is_control_well(row_letter, control_rows):
-            if label and str(label).strip():
-                if label not in label_to_rows:
-                    label_to_rows[label] = []
-                if row_letter not in label_to_rows[label]:
-                    label_to_rows[label].append(row_letter)
-    
-    # Create groups from labels
-    for label, row_letters in label_to_rows.items():
-        if len(row_letters) >= 1:  # At least 1 row with this label
-            groups.append({
-                "name": label,
-                "wells": sorted(row_letters)  # Store row letters only
-            })
-    
-    # Build mapping: well_id -> group name
-    # Use normalized well IDs for consistent matching
-    well_to_group = {}
-    for group in groups:
-        group_name = group.get("name", "")
-        group_wells = group.get("wells", [])
-        for row_letter in group_wells:
-            # Find all wells in this row across all columns
-            # Use well_normalized column for consistent matching
-            for normalized_well_id in norm_df["well_normalized"].unique():
-                if normalized_well_id:
-                    # Check if normalized well ID starts with the row letter
-                    if normalized_well_id and normalized_well_id[0] == row_letter:
-                        # Store mapping using normalized well ID (consistent format)
-                        well_to_group[normalized_well_id] = group_name
-    
-    # Per-well CSVs (normalized values with baseline, without SEM - SEM only belongs in triplicate CSVs)
-    plate_folder = os.path.join(csv_root, plate_id)
-    ensure_dir(plate_folder)
-    
-    wells = norm_df.groupby("well")
-    print(f"    Writing {len(wells)} per-well CSVs (normalized values)...", flush=True)
-    
-    # Write per-well CSVs with normalized values
-    for idx, (well_id, g) in enumerate(wells, 1):
-        # Normalize well ID for consistent file naming
-        normalized_well_id = normalize_well_id(str(well_id).strip())
-        safe_well = normalized_well_id.replace(" ", "").replace(":", "-")
-        out_path = os.path.join(plate_folder, f"{plate_id}_{safe_well}.csv")
-        g_sorted = g.sort_values("time_s")
-        
-        # Create output DataFrame with time and normalized value only (no SEM)
-        output_df = pd.DataFrame({
-            "time_s": g_sorted["time_s"].values,
-            "value": g_sorted["value"].values  # This is now normalized
-        })
-        output_df.to_csv(out_path, index=False)
-        
-        if idx % 5 == 0:
-            print(f"      Written {idx}/{len(wells)} wells...", flush=True)
-    
-    # Write condition-specific CSVs (genotype-buffer-triplicate)
-    # One CSV per condition-triplicate-column combination
-    # Using normalized values from norm_df
-    if column_info:
-        print(f"    Writing condition-specific CSVs (using normalized values)...", flush=True)
-        genotype = column_info.get("genotype", "")
-        buffer = column_info.get("buffer", "")
-        
-        # Group by group name and column
-        for group in groups:
-            group_name = group.get("name", "")
-            if not group_name:
-                continue
-            
-            # Get all wells in this triplicate group (across all columns)
-            # Use normalized well IDs for consistent matching
-            group_wells = []
-            for normalized_well_id in norm_df["well_normalized"].unique():
-                # Check using normalized well ID
-                if normalized_well_id in well_to_group and well_to_group[normalized_well_id] == group_name:
-                    # Store normalized well ID for consistency
-                    group_wells.append(normalized_well_id)
-            
-            if not group_wells:
-                continue
-            
-            # Group wells by column number
-            # Note: group_wells now contains normalized well IDs
-            wells_by_column = {}
-            for normalized_well_id in group_wells:
-                # Extract column number from normalized well ID (e.g., "B13" -> 13, "B05" -> 5)
-                try:
-                    column_num = int(''.join(filter(str.isdigit, str(normalized_well_id))))
-                    if column_num not in wells_by_column:
-                        wells_by_column[column_num] = []
-                    wells_by_column[column_num].append(normalized_well_id)
-                except (ValueError, AttributeError):
-                    continue
-            
-            # Create one CSV per column for this triplicate group
-            for column_num in sorted(wells_by_column.keys()):
-                column_wells = wells_by_column[column_num]
-                
-                # Get all time points for this column's wells (using normalized data)
-                # column_wells contains normalized well IDs, use well_normalized column for matching
-                # Filter out bad wells from column_wells
-                column_wells_filtered = [w for w in column_wells if not is_bad_well(w, config)]
-                if not column_wells_filtered:
-                    continue  # Skip this column if all wells are bad
-                
-                all_times = sorted(norm_df[norm_df["well_normalized"].isin(column_wells_filtered)]["time_s"].unique())
-                
-                # Calculate mean and SEM for each time point across wells in this triplicate group for this column
-                # Using normalized values
-                mean_values = []
-                sem_values = []
-                
-                for time in all_times:
-                    values_at_time = []
-                    for normalized_well_id in column_wells_filtered:
-                        well_data = norm_df[(norm_df["well_normalized"] == normalized_well_id) & (norm_df["time_s"] == time)]
-                        if not well_data.empty:
-                            values_at_time.append(well_data["value"].iloc[0])
-                    
-                    if len(values_at_time) >= 2:
-                        mean = sum(values_at_time) / len(values_at_time)
-                        variance = sum((v - mean) ** 2 for v in values_at_time) / (len(values_at_time) - 1) # Sample variance using Bessel's correction/sample standard deviation
-                        std_dev = variance ** 0.5
-                        sem = std_dev / (len(values_at_time) ** 0.5)
-                        mean_values.append(mean)
-                        sem_values.append(sem)
-                    elif len(values_at_time) == 1:
-                        mean_values.append(values_at_time[0])
-                        sem_values.append(None)
-                    else:
-                        mean_values.append(None)
-                        sem_values.append(None)
-                
-                # Create condition CSV filename: plate_id_triplicate_name_col{column}
-                # Plate ID already contains genotype and buffer, so just use triplicate name
-                # Keep hyphens in group name (e.g., "250-10-2"), just sanitize spaces and colons
-                safe_group_name = group_name.replace(" ", "_").replace(":", "-")
-                condition_path = os.path.join(csv_root, f"{plate_id}_{safe_group_name}_col{column_num}.csv")
-                
-                # Write condition CSV with normalized values
-                condition_df = pd.DataFrame({
-                    "time_s": all_times,
-                    "mean": mean_values,
-                    "sem": sem_values
-                })
-                condition_df.to_csv(condition_path, index=False)
-        
-        print(f"      Written condition-specific CSVs", flush=True)
-    
-    print(f"  ✓ Completed writing CSVs for {plate_id}", flush=True)
-
-
-def write_default_config(config_path: str):
-    """Write default configuration file from defaults."""
-    # Convert DEFAULT_WELL_LABELS to row-based format
-    well_labels = {}
-    for well_id, label in DEFAULT_WELL_LABELS.items():
-        if well_id and len(well_id) > 0 and well_id[0].isalpha():
-            row_letter = well_id[0]
-            if row_letter not in well_labels:
-                well_labels[row_letter] = label
-    
-    default_config = {
-        "well_labels": well_labels,
+def get_default_config(well_labels: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+    """Build a plate configuration dict, optionally seeded with detected well labels."""
+    return {
+        "well_labels": dict(sorted((well_labels or {}).items())),
         "control_rows": [],
-        "bad_wells": []
     }
-    
+
+
+def _relax_json_syntax(text: str) -> str:
+    """Fix common hand-edited JSON issues (e.g. trailing commas before } or ])."""
+    relaxed = text
+    prev = None
+    while prev != relaxed:
+        prev = relaxed
+        relaxed = re.sub(r",(\s*[\]}])", r"\1", relaxed)
+    return relaxed
+
+
+def _parse_config_json(raw: str) -> Tuple[Dict[str, Any], bool]:
+    """
+    Parse plate config JSON, tolerating trailing commas.
+    Returns (config, was_repaired).
+    """
+    raw = raw.strip()
+    if not raw:
+        raise ValueError("config file is empty")
+
+    try:
+        config = json.loads(raw)
+    except json.JSONDecodeError:
+        repaired = _relax_json_syntax(raw)
+        if repaired == raw:
+            raise
+        config = json.loads(repaired)
+        return config, True
+
+    return config, False
+
+
+def detect_well_labels_from_plate(
+    long_df: pd.DataFrame,
+    source_name: str,
+) -> Tuple[Dict[str, str], List[str]]:
+    """
+    Detect row-letter -> content label mapping from a single plate's content column.
+    Returns (labels, warnings).
+    """
+    well_content = long_df.groupby("well", as_index=False)["content"].first()
+    row_to_contents: Dict[str, Set[str]] = defaultdict(set)
+    warnings: List[str] = []
+
+    for _, row in well_content.iterrows():
+        well_id = str(row["well"]).strip()
+        content = "" if pd.isna(row["content"]) else str(row["content"]).strip()
+        if not content:
+            continue
+        parsed = _well_row_col(well_id)
+        if parsed is None:
+            continue
+        row_letter, _ = parsed
+        row_to_contents[row_letter].add(content)
+
+    labels: Dict[str, str] = {}
+    for row_letter in sorted(row_to_contents.keys()):
+        contents = sorted(c for c in row_to_contents[row_letter] if c)
+        if not contents:
+            continue
+        if len(contents) > 1:
+            warnings.append(
+                f"{source_name}: row {row_letter} has multiple content labels: {', '.join(contents)}"
+            )
+        labels[row_letter] = contents[0]
+
+    return labels, warnings
+
+
+def merge_well_labels_from_plates(
+    all_plates: Dict[str, pd.DataFrame],
+    plate_id_to_filename: Dict[str, str],
+) -> Tuple[Dict[str, str], List[str]]:
+    """
+    Merge well labels detected from all plates' content columns.
+    Rows found in only some files are combined; conflicting labels across files produce warnings.
+    """
+    merged: Dict[str, str] = {}
+    merged_sources: Dict[str, str] = {}
+    all_warnings: List[str] = []
+
+    for plate_id in sorted(all_plates.keys()):
+        long_df = all_plates[plate_id]
+        source_name = plate_id_to_filename.get(plate_id, plate_id)
+        file_labels, file_warnings = detect_well_labels_from_plate(long_df, source_name)
+        all_warnings.extend(file_warnings)
+
+        for row_letter, label in file_labels.items():
+            if row_letter not in merged:
+                merged[row_letter] = label
+                merged_sources[row_letter] = source_name
+            elif merged[row_letter] != label:
+                all_warnings.append(
+                    f"Label conflict for row {row_letter}: "
+                    f"'{merged[row_letter]}' in {merged_sources[row_letter]} vs "
+                    f"'{label}' in {source_name}"
+                )
+
+    return merged, all_warnings
+
+
+def write_default_config(
+    config_path: str,
+    detected_well_labels: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
+    """Write plate configuration file from Excel-detected well labels (only when none exists)."""
+    if os.path.exists(config_path):
+        raise RuntimeError(
+            f"Refusing to overwrite existing plate config: {os.path.basename(config_path)}"
+        )
+
+    default_config = get_default_config(detected_well_labels)
+
     try:
         with open(config_path, "w", encoding="utf-8") as f:
             json.dump(default_config, f, indent=2)
-        print(f"  Generated default configuration file: {os.path.basename(config_path)}", flush=True)
+        if detected_well_labels:
+            print(
+                f"  Generated configuration from Excel content column: {os.path.basename(config_path)}",
+                flush=True,
+            )
+        else:
+            print(f"  Generated default configuration file: {os.path.basename(config_path)}", flush=True)
     except Exception as e:
-        print(f"  Warning: Could not write default config file: {e}", flush=True)
+        record_warning(f"Could not write default config file: {e}")
+
+    return default_config
 
 
 def normalize_well_id(well_id: str) -> str:
@@ -795,60 +708,43 @@ def resolve_cross_file_well_column_conflicts(
     return plate_layout_slots
 
 
-def is_bad_well(well_id: str, config: Dict[str, Any] = None) -> bool:
+def load_config(
+    config_path: str,
+    detected_well_labels: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
     """
-    Check if a well is in the bad_wells list from config.
-    
-    Parameters:
-    -----------
-    well_id : str
-        Well ID to check (e.g., "B13", "B05")
-    config : Dict[str, Any], optional
-        Configuration dictionary. If None, loads from plate_config.json
-    
-    Returns:
-    --------
-    bool
-        True if the well is in the bad_wells list, False otherwise
+    Load plate configuration from disk.
+    Creates plate_config.json from Excel-detected labels only when the file does not exist.
+    Never overwrites or clears an existing config file.
     """
-    if config is None:
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        config_path = os.path.join(script_dir, "plate_config.json")
-        config = load_config(config_path)
-    
-    bad_wells = config.get("bad_wells", [])
-    if not isinstance(bad_wells, list):
-        return False
-    
-    # Normalize the input well ID for consistent matching
-    normalized_well_id = normalize_well_id(str(well_id).strip())
-    
-    # Check if normalized well ID matches any bad well (normalize bad wells too)
-    for bad_well in bad_wells:
-        normalized_bad_well = normalize_well_id(str(bad_well).strip())
-        if normalized_well_id == normalized_bad_well:
-            return True
-    
-    return False
+    if not os.path.exists(config_path):
+        return write_default_config(config_path, detected_well_labels)
 
-
-def load_config(config_path: str) -> Dict[str, Any]:
-    """Load plate configuration file if it exists, otherwise generate from defaults."""
-    if os.path.exists(config_path):
-        try:
-            with open(config_path, "r", encoding="utf-8") as f:
-                config = json.load(f)
-                print(f"  Loaded configuration from {os.path.basename(config_path)}", flush=True)
-                return config
-        except Exception as e:
-            print(f"  Warning: Could not load config file: {e}", flush=True)
-            # Generate default config if loading fails
-            write_default_config(config_path)
-            return {}
-    else:
-        # Generate default config file if it doesn't exist
-        write_default_config(config_path)
-        return {}
+    try:
+        with open(config_path, "r", encoding="utf-8-sig") as f:
+            raw = f.read()
+        config, was_repaired = _parse_config_json(raw)
+        if not isinstance(config, dict):
+            raise ValueError("config root must be a JSON object")
+        if was_repaired:
+            with open(config_path, "w", encoding="utf-8") as f:
+                json.dump(config, f, indent=2)
+                f.write("\n")
+            print(
+                f"  Repaired minor JSON syntax in {os.path.basename(config_path)} "
+                f"(e.g. trailing commas)",
+                flush=True,
+            )
+        print(f"  Loaded configuration from {os.path.basename(config_path)}", flush=True)
+        return config
+    except Exception as e:
+        record_warning(f"Could not load {os.path.basename(config_path)}: {e}")
+        print(
+            f"  Using empty defaults for this run only. "
+            f"Your existing config file was left unchanged — fix the JSON and rerun.",
+            flush=True,
+        )
+        return get_default_config()
 
 
 def build_viewer_json(
@@ -1017,12 +913,11 @@ def build_viewer_json(
         columns_str = ", ".join([str(c) for c in sorted_columns[:10]])
         if len(sorted_columns) > 10:
             columns_str += f", ... ({len(sorted_columns)} total)"
-        print(
-            f"  ⚠️  WARNING: {files_str} still have duplicate wells on the same layout "
-            f"(scientist={scientist}, group={column_group}, layout_slot={layout_slot + 1}): columns {columns_str}",
-            flush=True,
+        record_warning(
+            f"{files_str} still have duplicate wells on the same layout "
+            f"(scientist={scientist}, group={column_group}, layout_slot={layout_slot + 1}): columns {columns_str}. "
+            f"Only data from '{files[0]}' (first alphabetically) is used in the viewer."
         )
-        print(f"     Only data from '{files[0]}' (first alphabetically) is used in the viewer.", flush=True)
     
     data = {
         "config": {
@@ -1044,10 +939,6 @@ def build_viewer_json(
         for well_id, g in df.groupby("well"):
             # Normalize well ID to consistent format (zero-padded)
             normalized_well_id = normalize_well_id(well_id)
-            
-            # Skip bad wells
-            if is_bad_well(normalized_well_id, config):
-                continue
             
             g_sorted = g.sort_values("time_s")
             content = g_sorted["content"].iloc[0]
@@ -6254,12 +6145,6 @@ def fit_well_baselines(
     """
     baseline_fits = {}
     
-    # Filter out bad wells if config is provided
-    if config is not None:
-        bad_wells_list = config.get("bad_wells", [])
-        if bad_wells_list:
-            df = df[~df["well"].apply(lambda w: is_bad_well(w, config))]
-    
     # Get baseline windows for each well
     baseline_windows = identify_baseline_window(df, baseline_start_time, baseline_end_time)
     
@@ -6845,15 +6730,6 @@ def process_baseline_normalization(
         config_path = os.path.join(script_dir, "plate_config.json")
         config = load_config(config_path)
     
-    # Filter out bad wells before processing
-    bad_wells_list = config.get("bad_wells", [])
-    if bad_wells_list:
-        original_count = len(df)
-        df = df[~df["well"].apply(lambda w: is_bad_well(w, config))]
-        filtered_count = len(df)
-        if original_count != filtered_count:
-            print(f"Excluding {original_count - filtered_count} data points from bad wells", flush=True)
-    
     print("Step 1: Identifying baseline windows...", flush=True)
     baseline_windows = identify_baseline_window(df, baseline_start_time, baseline_end_time)
     print(f"  Identified baseline windows for {len(baseline_windows)} wells", flush=True)
@@ -6914,280 +6790,12 @@ def process_baseline_normalization(
     return norm_df, stats_df, baseline_fits
 
 
-def prompt_baseline_settings():
-    """
-    Prompt user for baseline and normalization settings.
-    Returns a tuple of (baseline_start_time, baseline_end_time, baseline_method, baseline_frac, baseline_poly_order, normalization_mode)
-    
-    If stdin is not available (non-interactive mode) or command-line arguments are provided,
-    returns default values or values from command-line arguments.
-    
-    Command-line arguments (optional):
-        --skip-csv                  Skip CSV generation; only generate web files. Does not modify existing csv folder.
-        --baseline-start-time FLOAT
-        --baseline-end-time FLOAT
-        --baseline-method {constant|lowess|polynomial}
-        --baseline-frac FLOAT (for LOWESS)
-        --baseline-poly-order INT (for polynomial)
-        --normalization-mode {multiplicative|delta_f_over_f|lowest_point|first_point|none|baseline_subtract_lowest|baseline_subtract_first}
-    """
-    import argparse
-    
-    # Parse command-line arguments first
-    parser = argparse.ArgumentParser(add_help=False)  # Don't show help, we'll handle prompts
-    parser.add_argument('--baseline-start-time', type=float, default=None)
-    parser.add_argument('--baseline-end-time', type=float, default=None)
-    parser.add_argument('--baseline-method', type=str, choices=['constant', 'lowess', 'polynomial'], default=None)
-    parser.add_argument('--baseline-frac', type=float, default=None)
-    parser.add_argument('--baseline-poly-order', type=int, default=None)
-    parser.add_argument('--normalization-mode', type=str, choices=['multiplicative', 'delta_f_over_f', 'lowest_point', 'first_point', 'none', 'baseline_subtract_lowest', 'baseline_subtract_first'], default=None)
-    
-    # Parse known args only (ignore unknown args that might be used elsewhere)
-    args, _ = parser.parse_known_args()
-    
-    # If all settings provided via command-line, use them (non-interactive)
-    if all([args.baseline_start_time is not None, args.baseline_end_time is not None, args.baseline_method is not None, 
-            args.normalization_mode is not None]):
-        baseline_start_time = args.baseline_start_time
-        baseline_end_time = args.baseline_end_time
-        baseline_method = args.baseline_method
-        baseline_frac = args.baseline_frac if args.baseline_frac is not None else 0.5
-        baseline_poly_order = args.baseline_poly_order if args.baseline_poly_order is not None else 1
-        
-        print("\n✓ Using command-line settings:")
-        print(f"  Baseline window: {baseline_start_time} s to {baseline_end_time} s")
-        print(f"  Baseline method: {baseline_method}")
-        if baseline_method == 'lowess':
-            print(f"  LOWESS smoothing fraction: {baseline_frac}")
-        elif baseline_method == 'polynomial':
-            print(f"  Polynomial order: {baseline_poly_order}")
-        print(f"  Normalization mode: {args.normalization_mode}\n")
-        return baseline_start_time, baseline_end_time, baseline_method, baseline_frac, baseline_poly_order, args.normalization_mode
-    
-    # Check if stdin is available (interactive mode)
-    if not sys.stdin.isatty():
-        print("\n⚠️  Running in non-interactive mode. Using default settings:")
-        print("  Baseline window: 0.0 s to 24.0 s")
-        print("  Baseline method: constant")
-        print("  Normalization mode: multiplicative\n")
-        return 0.0, 24.0, 'constant', 0.5, 1, 'multiplicative'
-    
-    print("\n" + "=" * 70)
-    print("BASELINE AND NORMALIZATION SETTINGS")
-    print("=" * 70)
-    print("\nThese settings will be used for CSV generation and normalization.")
-    print("In the web viewer: Step 0 (baseline subtraction) and Step 1 (normalization) can be")
-    print("enabled separately; Step 2 (group triplicates) requires Step 0 or Step 1.")
-    print("You can change all of these later in the web interface.")
-    print("(Press Enter to accept defaults)\n")
-    
-    # Prompt for baseline start time (use command-line arg if provided)
-    baseline_start_time = None
-    if args.baseline_start_time is not None:
-        baseline_start_time = args.baseline_start_time
-        print(f"Baseline window start time: {baseline_start_time} s (from command-line)")
-    else:
-        while True:
-            try:
-                baseline_start_input = input("Baseline window start time (seconds) [default: 0.0]: ").strip()
-                if not baseline_start_input:
-                    baseline_start_time = 0.0
-                else:
-                    baseline_start_time = float(baseline_start_input)
-                    if baseline_start_time < 0:
-                        print("  ⚠️  Please enter a non-negative number.")
-                        continue
-                break
-            except (ValueError, EOFError, KeyboardInterrupt):
-                print("\n  ⚠️  Using default value: 0.0")
-                baseline_start_time = 0.0
-                break
-    
-    # Prompt for baseline end time (use command-line arg if provided)
-    baseline_end_time = None
-    if args.baseline_end_time is not None:
-        baseline_end_time = args.baseline_end_time
-        print(f"Baseline window end time: {baseline_end_time} s (from command-line)")
-    else:
-        while True:
-            try:
-                baseline_input = input("Baseline window end time (seconds) [default: 24.0]: ").strip()
-                if not baseline_input:
-                    baseline_end_time = 24.0
-                else:
-                    baseline_end_time = float(baseline_input)
-                    if baseline_end_time <= baseline_start_time:
-                        print(f"  ⚠️  Please enter a number greater than start time ({baseline_start_time} s).")
-                        continue
-                break
-            except (ValueError, EOFError, KeyboardInterrupt):
-                print("\n  ⚠️  Using default value: 24.0")
-                baseline_end_time = 24.0
-                break
-    
-    # Prompt for baseline method (use command-line arg if provided)
-    if args.baseline_method is not None:
-        baseline_method = args.baseline_method
-        print(f"\nBaseline method: {baseline_method} (from command-line)")
-    else:
-        print("\nBaseline fitting method:")
-        print("  1. constant - Mean of baseline window (default)")
-        print("  2. lowess - Locally Weighted Scatterplot Smoothing")
-        print("  3. polynomial - Polynomial fit")
-        while True:
-            try:
-                method_input = input("Select method [1-3, default: 1]: ").strip()
-                if not method_input:
-                    baseline_method = 'constant'
-                    break
-                elif method_input == '1':
-                    baseline_method = 'constant'
-                    break
-                elif method_input == '2':
-                    baseline_method = 'lowess'
-                    break
-                elif method_input == '3':
-                    baseline_method = 'polynomial'
-                    break
-                else:
-                    print("  ⚠️  Please enter 1, 2, or 3.")
-            except (EOFError, KeyboardInterrupt):
-                print("\n  ⚠️  Using default method: constant")
-                baseline_method = 'constant'
-                break
-    
-    # Prompt for LOWESS frac (if LOWESS selected)
-    if args.baseline_frac is not None:
-        baseline_frac = args.baseline_frac
-        if baseline_method == 'lowess':
-            print(f"LOWESS smoothing fraction: {baseline_frac} (from command-line)")
-    else:
-        baseline_frac = 0.5
-        if baseline_method == 'lowess':
-            while True:
-                try:
-                    frac_input = input("LOWESS smoothing fraction (0.1-1.0) [default: 0.5]: ").strip()
-                    if not frac_input:
-                        baseline_frac = 0.5
-                    else:
-                        baseline_frac = float(frac_input)
-                        if baseline_frac < 0.1 or baseline_frac > 1.0:
-                            print("  ⚠️  Please enter a value between 0.1 and 1.0.")
-                            continue
-                    break
-                except (ValueError, EOFError, KeyboardInterrupt):
-                    print("\n  ⚠️  Using default value: 0.5")
-                    baseline_frac = 0.5
-                    break
-    
-    # Prompt for polynomial order (if polynomial selected)
-    if args.baseline_poly_order is not None:
-        baseline_poly_order = args.baseline_poly_order
-        if baseline_method == 'polynomial':
-            print(f"Polynomial order: {baseline_poly_order} (from command-line)")
-    else:
-        baseline_poly_order = 1
-        if baseline_method == 'polynomial':
-            while True:
-                try:
-                    order_input = input("Polynomial order (1-5) [default: 1]: ").strip()
-                    if not order_input:
-                        baseline_poly_order = 1
-                    else:
-                        baseline_poly_order = int(order_input)
-                        if baseline_poly_order < 1 or baseline_poly_order > 5:
-                            print("  ⚠️  Please enter a value between 1 and 5.")
-                            continue
-                    break
-                except (ValueError, EOFError, KeyboardInterrupt):
-                    print("\n  ⚠️  Using default value: 1")
-                    baseline_poly_order = 1
-                    break
-    
-    # Prompt for normalization mode (use command-line arg if provided)
-    if args.normalization_mode is not None:
-        normalization_mode = args.normalization_mode
-        print(f"\nNormalization mode: {normalization_mode} (from command-line)")
-    else:
-        print("\nNormalization / processing mode:")
-        print("  1. multiplicative - F(t) / g(t) (default)")
-        print("  2. delta_f_over_f - (F(t) - g(t)) / g(t)")
-        print("  3. lowest_point - F(t) / min(F_baseline_range)")
-        print("  4. first_point - F(t) / F_first_after_baseline_range")
-        print("  5. none - no normalization (use raw values)")
-        print("  6. baseline_subtract_lowest - subtract min(baseline) from all points (Step 0 style)")
-        print("  7. baseline_subtract_first - subtract first point after baseline from all points (Step 0 style)")
-        while True:
-            try:
-                norm_input = input("Select mode [1-7, default: 1]: ").strip()
-                if not norm_input:
-                    normalization_mode = 'multiplicative'
-                    break
-                elif norm_input == '1':
-                    normalization_mode = 'multiplicative'
-                    break
-                elif norm_input == '2':
-                    normalization_mode = 'delta_f_over_f'
-                    break
-                elif norm_input == '3':
-                    normalization_mode = 'lowest_point'
-                    break
-                elif norm_input == '4':
-                    normalization_mode = 'first_point'
-                    break
-                elif norm_input == '5':
-                    normalization_mode = 'none'
-                    break
-                elif norm_input == '6':
-                    normalization_mode = 'baseline_subtract_lowest'
-                    break
-                elif norm_input == '7':
-                    normalization_mode = 'baseline_subtract_first'
-                    break
-                else:
-                    print("  ⚠️  Please enter 1, 2, 3, 4, 5, 6, or 7.")
-            except (EOFError, KeyboardInterrupt):
-                print("\n  ⚠️  Using default mode: multiplicative")
-                normalization_mode = 'multiplicative'
-                break
-    
-    # Only print summary if we prompted (not if all settings came from command-line)
-    if not all([args.baseline_start_time is not None, args.baseline_end_time is not None, args.baseline_method is not None, 
-                args.normalization_mode is not None]):
-        print("\n" + "=" * 70)
-        print("SELECTED SETTINGS:")
-        print(f"  Baseline window: {baseline_start_time} s to {baseline_end_time} s")
-        print(f"  Baseline method: {baseline_method}")
-        if baseline_method == 'lowess':
-            print(f"  LOWESS smoothing fraction: {baseline_frac}")
-        elif baseline_method == 'polynomial':
-            print(f"  Polynomial order: {baseline_poly_order}")
-        print(f"  Normalization mode: {normalization_mode}")
-        print("=" * 70 + "\n")
-    
-    return baseline_start_time, baseline_end_time, baseline_method, baseline_frac, baseline_poly_order, normalization_mode
-
-
 def main():
     # Use the directory where this script lives as the working directory
     script_dir = os.path.dirname(os.path.abspath(__file__))
     os.chdir(script_dir)
-    
-    # Parse --skip-csv first (so we can skip baseline prompts when only generating web files)
-    import argparse as _argparse
-    _skip_parser = _argparse.ArgumentParser()
-    _skip_parser.add_argument('--skip-csv', action='store_true', help='Skip CSV generation; only generate web files. Does not modify existing csv folder.')
-    _skip_args, _ = _skip_parser.parse_known_args()
-    skip_csv = _skip_args.skip_csv
-    
-    if skip_csv:
-        print("Skip CSV generation: enabled (only generating web files; existing csv folder will not be modified).\n", flush=True)
-    
-    # Prompt for baseline and normalization settings (only needed when generating CSVs)
-    if not skip_csv:
-        baseline_start_time, baseline_end_time, baseline_method, baseline_frac, baseline_poly_order, normalization_mode = prompt_baseline_settings()
-    else:
-        baseline_start_time = baseline_end_time = baseline_method = baseline_frac = baseline_poly_order = normalization_mode = None  # unused
+    clear_run_logs()
+    set_run_log_dir(script_dir)
 
     # Find Excel files in this directory
     excel_files = [
@@ -7196,8 +6804,8 @@ def main():
     ]
 
     if not excel_files:
-        print("No .xlsx files found in this folder.", file=sys.stderr)
-        sys.exit(1)
+        record_error("No .xlsx files found in this folder.")
+        exit_with_log(1, script_dir)
     
     # Validate filename formats before processing
     print("Starting plate viewer script...", flush=True)
@@ -7210,26 +6818,16 @@ def main():
             invalid_files.append((fname, str(e)))
     
     if invalid_files:
-        print("\n❌ ERROR: Invalid filename format(s) detected:", file=sys.stderr)
+        record_error("Invalid filename format(s) detected.")
         for fname, error_msg in invalid_files:
-            print(f"\nFile: {fname}", file=sys.stderr)
-            print(error_msg, file=sys.stderr)
-        print("\nPlease rename the file(s) to match the expected format and rerun the script.", file=sys.stderr)
-        sys.exit(1)
+            record_error(f"File: {fname}")
+            record_error(error_msg)
+        record_error("Please rename the file(s) to match the expected format and rerun the script.")
+        exit_with_log(1, script_dir)
     
     print(f"✓ All {len(excel_files)} file(s) have valid filename formats", flush=True)
 
     all_plates: Dict[str, pd.DataFrame] = {}
-    csv_root = os.path.join(script_dir, "csv")
-    
-    # Delete old CSV folder only when generating CSVs
-    if not skip_csv and os.path.exists(csv_root):
-        print(f"Deleting existing CSV folder: {csv_root}", flush=True)
-        shutil.rmtree(csv_root)
-    
-    # Load configuration file early so it can be used for CSV generation and web
-    config_path = os.path.join(script_dir, "plate_config.json")
-    config = load_config(config_path)
     
     # Track plate_ids and their source files to detect duplicates
     plate_id_to_files: Dict[str, List[str]] = {}
@@ -7242,7 +6840,7 @@ def main():
         try:
             long_df = parse_plate_file(path)
         except Exception as e:
-            print(f"Error parsing {fname}: {e}", file=sys.stderr, flush=True)
+            record_error(f"Error parsing {fname}: {e}")
             continue
 
         plate_id = long_df["plate_id"].iloc[0]
@@ -7261,43 +6859,51 @@ def main():
         else:
             all_plates[plate_id] = long_df
 
+    if not all_plates:
+        record_error("No plates were successfully parsed.")
+        exit_with_log(1, script_dir)
+
+    config_path = os.path.join(script_dir, "plate_config.json")
+    if os.path.exists(config_path):
+        print(f"\nUsing existing {os.path.basename(config_path)} (Excel detection skipped).", flush=True)
+        config = load_config(config_path)
+    else:
+        print("\nNo plate_config.json found — detecting well labels from Excel content column...", flush=True)
+        detected_well_labels, label_warnings = merge_well_labels_from_plates(
+            all_plates, plate_id_to_filename
+        )
+        if detected_well_labels:
+            print(
+                f"  Detected labels for row(s): {', '.join(sorted(detected_well_labels.keys()))}",
+                flush=True,
+            )
+        else:
+            print("  No content labels detected in Excel files.", flush=True)
+
+        if label_warnings:
+            record_warning("Conflicting content labels detected across Excel files.")
+            for warning in label_warnings:
+                record_warning(warning)
+
+        config = load_config(config_path, detected_well_labels)
+
     print("\nResolving cross-file well/column overlaps (same scientist + condition group)...", flush=True)
     plate_layout_slots = resolve_cross_file_well_column_conflicts(all_plates, plate_id_to_filename)
-
-    if not skip_csv:
-        for plate_id in sorted(all_plates.keys()):
-            write_csvs_for_plate(
-                all_plates[plate_id],
-                csv_root,
-                config,
-                plate_id_to_filename.get(plate_id, plate_id + ".xlsx"),
-                baseline_start_time=baseline_start_time,
-                baseline_end_time=baseline_end_time,
-                baseline_method=baseline_method,
-                baseline_frac=baseline_frac,
-                baseline_poly_order=baseline_poly_order,
-                normalization_mode=normalization_mode,
-            )
 
     # Check for duplicates and warn
     duplicates_found = False
     for plate_id, files in plate_id_to_files.items():
         if len(files) > 1:
             duplicates_found = True
-            print(f"\n⚠️  WARNING: Duplicate dataset detected!", file=sys.stderr)
-            print(f"   Plate ID '{plate_id}' is produced by multiple files:", file=sys.stderr)
+            record_warning(f"Duplicate dataset detected: plate ID '{plate_id}' is produced by multiple files.")
             for f in files:
-                print(f"     - {f}", file=sys.stderr)
-            print(f"   Please delete the duplicate file(s) and rerun the script.", file=sys.stderr)
+                record_warning(f"  - {f}")
+            record_warning("Please delete the duplicate file(s) and rerun the script.")
     
     if duplicates_found:
-        print("\n⚠️  ERROR: Duplicate datasets found. Please delete duplicates and rerun.", file=sys.stderr)
-        print("   Only the first occurrence of each duplicate will be included.", file=sys.stderr)
-        sys.exit(1)
-
-    if not all_plates:
-        print("No plates were successfully parsed.", file=sys.stderr)
-        sys.exit(1)
+        record_error("Duplicate datasets found. Please delete duplicates and rerun.")
+        record_error("Only the first occurrence of each duplicate will be included.")
+        exit_with_log(1, script_dir)
     
     print(f"\n✓ Successfully loaded {len(all_plates)} dataset(s):", flush=True)
     for plate_id in sorted(all_plates.keys()):
@@ -7318,12 +6924,14 @@ def main():
     # Create double-clickable launcher files
     web_command_path, web_bat_path = write_web_command(script_dir, web_dir)
 
+    warnings_path, errors_path = write_run_log_files(script_dir)
+    if warnings_path:
+        print(f"Warnings written to: {warnings_path}", flush=True)
+    if errors_path:
+        print(f"Errors written to: {errors_path}", flush=True)
+
     print("Done.", flush=True)
     print("Generated:", flush=True)
-    if skip_csv:
-        print(f"  CSVs: unchanged (skipped)", flush=True)
-    else:
-        print(f"  CSVs in: {csv_root}", flush=True)
     print(f"  Web viewer: {html_path}", flush=True)
     print(f"  Web launcher (macOS/Linux): {web_command_path}", flush=True)
     print(f"  Web launcher (Windows): {web_bat_path}", flush=True)

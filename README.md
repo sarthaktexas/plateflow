@@ -1,17 +1,26 @@
 # Plate Viewer
-A robust fluorescence plate-reader analysis pipeline for kinetic assays. Includes per-well baseline fitting, baseline subtraction, normalization, replicate aggregation, mean ± SEM statistics, and kinetic modeling with automated parameter extraction. Designed for multi-plate datasets with noisy baselines and variable well performance. Supports different plate sizes but defaults to 384-well plates.
+A fluorescence plate-reader analysis tool for kinetic assays. The Python script parses Excel plate-reader exports and builds an interactive web viewer. Baseline fitting, baseline subtraction, normalization, replicate aggregation, mean ± SEM statistics, regression curve fitting, and kinetic modeling all run in the browser. Designed for multi-plate datasets with noisy baselines and variable well performance. Supports different plate sizes but defaults to 384-well plates.
 <img width="1792" height="1032" alt="image" src="https://github.com/user-attachments/assets/884ce123-503a-4c06-bfdc-d758f3550b1f" />
 ## Overview
 
-Plate Viewer processes Excel files containing fluorescence time-course data from multi-well plates and generates:
-- **CSV files**: Individual well data and condition-specific aggregated data (mean ± SEM)
-- **Interactive web viewer**: A modern browser-based interface for exploring and analyzing plate data
+Plate Viewer processes Excel files containing fluorescence time-course data from multi-well plates and generates an **interactive web viewer** for exploring and analyzing plate data.
 
-The tool supports baseline subtraction (no division), baseline normalization, triplicate grouping, regression curve fitting, and statistical analysis. You can copy or download the chart as an image, combine datasets by scientist, and filter by column per scientist.
+**What the script does:** validates filenames, parses Excel files, resolves multi-plate layout conflicts, loads or auto-generates `plate_config.json`, and writes `web/viewer_data.json` plus `web/index.html`.
+
+**What the web viewer does:** baseline subtraction, normalization, triplicate grouping, statistics, regression fitting, well exclusion, and chart export (PNG or CSV). There is no separate CSV export step or `csv/` output folder.
 
 ## Features
 
+### Configuration and Run Logs
+
+- **Auto plate config**: On first run (no `plate_config.json`), well labels are detected from the Excel **Content** column and merged across all files.
+- **Existing config preserved**: `plate_config.json` is never overwritten with defaults or re-detected from Excel once it exists.
+- **Forgiving JSON**: Hand-edited config files tolerate common mistakes (e.g. trailing commas after the last entry). Minor syntax issues are auto-repaired and saved as valid JSON on load.
+- **Run logs**: Warnings and errors are written to `WARNINGS.txt` and `ERRORS.txt` in the project folder.
+
 ### Data Processing Workflow
+
+All steps below are configured in the **web viewer** (not at script run time):
 
 0. **Baseline Subtraction** (Step 0, optional)
    - Subtract all points from a reference: **lowest point in baseline range** or **first point after baseline**
@@ -107,15 +116,15 @@ pip install pandas numpy scipy matplotlib openpyxl statsmodels
 ### Basic Usage
 
 1. Place your `.xlsx` files in the same directory as `plate_viewer.py`
-2. Run the script:
+2. Run the script (non-interactive — no baseline or normalization prompts):
    ```bash
    python3 plate_viewer.py
    ```
 3. The script will:
    - Validate filename formats
    - Process all Excel files
-   - Generate CSV files in the `csv/` directory
    - Create web viewer files in the `web/` directory
+   - Write `WARNINGS.txt` and/or `ERRORS.txt` when issues are detected (see [Run Logs](#run-logs))
 4. Launch the web viewer:
    - Double-click `web.command` in Finder, or
    - Run `./web.command` in Terminal
@@ -144,52 +153,103 @@ The script extracts:
 
 Excel files should contain:
 - A sheet named "Table All Data points" (or the first sheet will be used)
-- A row with "Well" in column A and "Time [s]" in column B
-- Data rows with:
-  - Column A: Well ID (e.g., "B13", "C14")
-  - Column B: Content/label
-  - Column C+: Time values (in seconds)
-  - Subsequent columns: Fluorescence values for each timepoint
+- A header row with **Well** in column A and **Content** in column B
+- An optional **Group** column in column C (BMG Voyager exports; ignored by the parser)
+- A **Time [s]** row directly below the header row (typically in column B)
+- Numeric time values (seconds) starting in the first column after any non-numeric cells on the Time row (column D when a Group column is present)
+- Fluorescence channel headers (e.g. `Raw Data (485-20/535-20)`) may appear on the header row above the time values
+
+**Layout example (with optional Group column):**
+
+| | A | B | C | D | E | … |
+|---|---|---|---|---|---|---|
+| Header | Well | Content | Group | Raw Data … | Raw Data … | … |
+| Time | | Time [s] | | 0 | 20.5 | … |
+| Data | B02 | SEC only | A | 1191 | 989421 | … |
+
+**Data columns:**
+- Column A: Well ID (e.g., "B13", "C14")
+- Column B: Content/label (used for auto-detecting `plate_config.json` on first run)
+- Column C: Group (optional; not used by the viewer)
+- Column D+: Fluorescence values for each timepoint (aligned with the time row)
 
 ## Configuration
 
 ### Plate Configuration File
 
-Create or edit `plate_config.json` to customize:
+Create or edit `plate_config.json` to customize well labels and control rows:
 
 ```json
 {
   "well_labels": {
-    "B": "250-10-2",
-    "C": "250-10-2",
-    "D": "250-10-2",
-    "E": "500-10-2",
-    ...
+    "B": "SOS1 - 2uM",
+    "C": "SOS1 - 2uM",
+    "D": "SOS1 - 2uM",
+    "E": "SOS1 - 4uM",
+    "F": "SOS1 - 4uM",
+    "G": "SOS1 - 4uM"
   },
-  "triplicate_groups": [
-    {
-      "name": "250-10-2",
-      "wells": ["B", "C", "D"]
-    },
-    {
-      "name": "500-10-2",
-      "wells": ["E", "F", "G"]
-    },
-    ...
-  ],
   "control_rows": ["N", "O"]
 }
 ```
 
 **Configuration Options:**
 
-- **well_labels**: Map row letters to condition labels (applies to all columns)
-- **triplicate_groups**: Define groups of wells that are replicates
-  - `name`: Condition name for the group
-  - `wells`: Array of row letters (e.g., ["B", "C", "D"])
-- **control_rows**: Array of row letters that are control wells (independently selectable, not grouped). When using a plate config, no control rows or triplicate groups are assumed by default; specify explicitly if needed.
+- **well_labels**: Map row letters to condition labels (applies to all columns). Triplicate groups in the web viewer are **auto-generated** from rows that share the same label.
+- **control_rows**: Row letters for control wells (independently selectable, not grouped). When using a plate config, no control rows are assumed unless you specify them.
 
-If no configuration file exists, the script will auto-generate one with defaults based on the data.
+To exclude individual wells from analysis, use the **Well Selector** in the web viewer (not `plate_config.json`). Per-well exclusion works per dataset in the viewer and is the supported approach when the same well position appears on multiple plates.
+
+#### Editing the config safely
+
+You can edit `plate_config.json` in any text editor. The loader is lenient about small syntax mistakes that strict JSON does not allow:
+
+- **Trailing commas** after the last item in an object or array (e.g. `"M": "label",` before `}`) are accepted and automatically fixed.
+- On repair, the script rewrites the file as valid JSON and prints: `Repaired minor JSON syntax in plate_config.json (e.g. trailing commas)`.
+- Your labels and settings are preserved — repairs only fix formatting, not content.
+
+If the file has a **serious JSON error** that cannot be auto-repaired, the script:
+
+1. Leaves your file **unchanged** on disk
+2. Records the error in `WARNINGS.txt`
+3. Uses empty defaults for **that run only** (no well labels or control rows)
+
+Fix the JSON and rerun; nothing is reset to Excel-detected or built-in defaults.
+
+#### Auto-detection from Excel (first run only)
+
+If **`plate_config.json` does not exist**, the script creates it automatically by reading the **Content** column (column B) in your Excel files:
+
+1. For each well, the row letter (e.g. `B` from `B13`) is mapped to that well’s content label.
+2. **Multiple Excel files are merged**: if one file has content in rows B, C, D and another has B, C, E, the generated config includes all of those rows.
+3. **Conflicting labels** (same row, different content in different files, or multiple labels within one file for the same row) are recorded as warnings in `WARNINGS.txt`.
+
+**Important:** An existing `plate_config.json` is **never replaced or regenerated from Excel**. Auto-detection runs only when the file is missing. To regenerate from Excel, delete `plate_config.json` and rerun the script.
+
+## Run Logs
+
+During each run, the script collects warnings and errors and writes them to the project folder:
+
+| File | Contents |
+|------|----------|
+| `WARNINGS.txt` | Non-fatal issues (label conflicts, duplicate column overlaps, missing preferred Excel sheet, config load issues, etc.) |
+| `ERRORS.txt` | Fatal or serious issues (invalid filenames, parse failures, duplicate plate IDs, no data found, etc.) |
+
+- Messages are also printed to the terminal.
+- If a run completes with no warnings or errors, the corresponding file is removed (so stale logs from a previous run are not left behind).
+- On fatal exit, log files are written before the script stops.
+
+**Examples of what appears in `WARNINGS.txt`:**
+- Content label conflicts when auto-generating `plate_config.json`
+- Unrecoverable `plate_config.json` parse errors (file left unchanged; fix JSON and rerun)
+- Duplicate wells on the same layout across files (only the first file alphabetically is used in the viewer)
+- Excel sheet `"Table All Data points"` not found (first sheet used instead)
+
+**Examples of what appears in `ERRORS.txt`:**
+- Invalid filename format
+- Failed Excel parse for a specific file
+- Duplicate datasets (same plate ID from multiple files)
+- No `.xlsx` files or no plates successfully parsed
 
 ## Web Viewer Options
 
@@ -246,6 +306,7 @@ When multiple plates share the same column group but have different scientist in
 
 - **Copy as image**: Copies the current chart as a PNG to the clipboard (falls back to download if copy is not supported).
 - **Download as image**: Saves the current chart as a PNG file (`plate-viewer-chart-YYYY-MM-DD-HHMMSS.png`).
+- **Download as CSV**: Exports the currently displayed chart series (and SEM columns when shown) as a CSV file.
 - **Interactive legend**: Click to show/hide datasets.
 - **Error bars**: SEM for triplicate (or n-plicate) groups.
 - **Tooltips**: Hover over points to see values (and ± error when available).
@@ -263,17 +324,13 @@ When multiple plates share the same column group but have different scientist in
 The `run_plate_viewer.applescript` file embeds the Python code as base64-encoded text. You can compile it into a quick action which appears in Finder when you right-click a folder.
 Please use Automator to create this.
 
-**AppleScript / Quick Action CSV generation does not work** — it is intentionally disabled in the bundled script. The Quick Action only runs the pipeline with `--skip-csv` so it produces **web viewer files only**. To generate CSV files, run `python3 plate_viewer.py` from Terminal in the folder that contains your `.xlsx` files (see [Basic Usage](#basic-usage)).
-
-### What the AppleScript Does
-
 The AppleScript:
 1. Prompts user to select a folder containing `.xlsx` files (or uses folder from Automator/Finder)
 2. Automatically installs required Python packages if needed:
    - Tries `pip install --user` first
    - Falls back to `--break-system-packages` for Python 3.11+
    - Tries without flags as last resort
-3. Decodes and executes the embedded Python code with **`--skip-csv`** (web viewer output only; no CSV prompts)
+3. Decodes and executes the embedded Python code
 4. Processes all Excel files in the selected folder and refreshes the web viewer data
 5. Shows a completion notification
 
@@ -286,18 +343,14 @@ How do I do that?
 
 ## Output Files
 
-### CSV Files
+### Run Logs
 
-Generated in `csv/<plate_id>/`:
+Written in the same directory as `plate_viewer.py` (when applicable):
 
-1. **Per-well CSVs**: `{plate_id}_{well_id}.csv`
-   - Columns: `time_s`, `value`
-   - One file per well
+- `WARNINGS.txt` — non-fatal issues from the current run
+- `ERRORS.txt` — errors from the current run (including runs that exit early)
 
-2. **Condition-specific CSVs**: `{plate_id}_{condition_name}_col{column}.csv`
-   - Columns: `time_s`, `mean`, `sem`
-   - One file per condition-column combination
-   - Contains mean ± SEM across triplicate wells
+See [Run Logs](#run-logs) for details.
 
 ### Web Viewer Files
 
@@ -323,6 +376,8 @@ For each condition and timepoint:
 
 ## Troubleshooting
 
+Check **`WARNINGS.txt`** and **`ERRORS.txt`** in the project folder first — they list issues from the most recent run with full detail.
+
 ### "No .xlsx files found"
 - Ensure Excel files are in the same directory as `plate_viewer.py`
 - Check that files have `.xlsx` extension (not `.xls`)
@@ -334,10 +389,28 @@ For each condition and timepoint:
 ### "Duplicate datasets found"
 - Multiple files are producing the same plate_id
 - Delete duplicate files and rerun
+- See `ERRORS.txt` for which plate ID and files are involved
+
+### Content label conflicts
+- Occurs when auto-generating `plate_config.json` and different Excel files assign different labels to the same row
+- Details are in `WARNINGS.txt`; the first-seen label is used in the generated config
+- Fix by editing `plate_config.json` manually, or delete it and resolve conflicts in the Excel content column before rerunning
+
+### `plate_config.json` could not be loaded
+- Usually caused by invalid JSON that auto-repair cannot fix (unclosed quotes, missing commas between keys, etc.)
+- Trailing commas after the last entry are fixed automatically — you should not see a warning for those
+- Check `WARNINGS.txt` for the exact parse error and line number
+- Your file on disk is **not** modified; fix the JSON and rerun
+- If you want to start over, delete `plate_config.json` and rerun to regenerate from Excel
 
 ### "Could not find 'Well' header row"
 - Ensure Excel file has "Well" in column A of the header row
-- Check that "Time [s]" appears in column B of the same or next row
+- Check that "Time [s]" appears on the row directly below the header (usually column B)
+
+### "No timepoints parsed"
+- Usually means time values were not found on the Time row — often because an optional **Group** column in column C shifted the data without being accounted for
+- Confirm the Time row has numeric seconds (e.g. `0`, `20.5`) starting in column D when column C is **Group**, or column C when there is no Group column
+- Ensure the header row uses **Group** (not a different label) in column C if that column is present
 
 ### Web server won't start
 - Ensure Python 3 is installed: `python3 --version`
@@ -351,15 +424,9 @@ For each condition and timepoint:
 
 ## Advanced Usage
 
-### Command Line Options
+`plate_viewer.py` is a one-shot, non-interactive pipeline: it processes all `.xlsx` files in the current directory and regenerates the web viewer. Baseline subtraction, normalization, well exclusion, and chart export are configured entirely in the web interface.
 
-When run interactively, `plate_viewer.py` may prompt for:
-
-- **Normalization / processing mode** (for CSV generation): `none` (raw values), `delta_f_over_f`, `multiplicative`, `lowest_point`, `first_point`, `baseline_subtract_lowest` (Step 0: subtract from lowest point in baseline range), or `baseline_subtract_first` (Step 0: subtract from first point after baseline). These align with the web viewer’s Step 0 and Step 1; baseline-subtract modes produce baseline-subtracted CSVs without division; `none` skips normalization so CSVs contain raw fluorescence.
-- **Baseline fitting method** (when a normalization mode that uses a fitted baseline is chosen): LOWESS, constant, or polynomial, with optional parameters (e.g. smoothing fraction, polynomial order).
-- **Baseline window end time**: End time (seconds) for the baseline window used in normalization or Step 0.
-
-The script processes all `.xlsx` files in the current directory. Optional command-line arguments (e.g. `--normalization`, `--baseline-method`) may be available; run `python3 plate_viewer.py --help` to check.
+There is no `csv/` output directory and no command-line flags for baseline or normalization settings.
 
 ### Customizing Defaults
 
@@ -368,9 +435,9 @@ Edit constants in `plate_viewer.py`:
 - `PLATE_ROWS`: Row letters (default: "ABCDEFGHIJKLMNOP")
 - `PLATE_COLS`: Number of columns (default: 24)
 - `SHEET_NAME_PREFERRED`: Preferred Excel sheet name (default: "Table All Data points")
-- `DEFAULT_WELL_LABELS`: Default well label mappings
-- `DEFAULT_TRIPLICATE_GROUPS`: Default triplicate group definitions
 - `TRIPLICATE_COLORS`: Color palette for triplicate groups
+
+Well labels are normally defined in `plate_config.json` (auto-detected from the Excel content column on first run). The script does not use hardcoded default well labels.
 
 ## License
 
